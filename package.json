@@ -1,0 +1,11 @@
+{
+  "name": "rewardor-js",
+  "version": "1.0.0",
+  "description": "reward program distribution",
+  "main": "index.js",
+  "dependencies": {
+    "axios": "^0.27.2",
+    "dotenv": "^16.0.1",
+    "ethers": "^5.5.4"
+  }
+}
