@@ -33,25 +33,19 @@ const graphApiUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/comp
 
 const pricePoolCache = {}
 
-async function getCompoundSessions(from, to) {
-
-    const sessions = []
-    let skip = 0
+// in the case of sessions with too many compounds - do paging
+async function getCompoundsPaged(sessionId, from, to) {
+    const compounds = []
     const take = 1000
     let result
+
     do {
         result = await axios.post(graphApiUrl, {
             query: `{
-                compoundSessions(first: ${take}, skip: ${skip}, where: { endBlockNumber_gt: ${from}, startBlockNumber_lt: ${to}}) {
-                  startBlockNumber
-                  endBlockNumber
-                  account
-                  token {
-                    id
-                  }
-                  compounds {
-                      amountAdded0
-                      amountAdded1
+                compoundSession(id: "${sessionId}") {
+                  compounds(first:${take}, where: { blockNumber_gte: ${from}, blockNumber_lt: ${to}}, orderBy: blockNumber, orderDirection: asc) {
+                    amountAdded0
+                    amountAdded1
                     blockNumber
                     token0
                     token1
@@ -59,8 +53,57 @@ async function getCompoundSessions(from, to) {
                 }
               }`
         })
-        skip += take
-        sessions.push(...result.data.data.compoundSessions)
+        compounds.push(...result.data.data.compoundSession.compounds)
+
+        if (result.data.data.compoundSession.compounds.length == take) {
+            from = parseInt(result.data.data.compoundSession.compounds[result.data.data.compoundSession.compounds.length - 1].blockNumber, 10) + 1 // paging by block number - assumes there is only one compound per block
+        }
+    } while (result.data.data.compoundSession.compounds.length == take)
+
+    return compounds
+}
+
+async function getCompoundSessionsPaged(from, to) {
+    const sessions = []
+    const take = 1000
+    let result
+    let currentFrom = from
+    do {
+        result = await axios.post(graphApiUrl, {
+            query: `{
+                compoundSessions(first: ${take}, where: { endBlockNumber_gte: ${currentFrom}, startBlockNumber_lt: ${to}}, orderBy: endBlockNumber, orderDirection: asc) {
+                  id
+                  startBlockNumber
+                  endBlockNumber
+                  account
+                  token {
+                    id
+                  }
+                  compounds(first:1000, where: { blockNumber_gte: ${from}, blockNumber_lt: ${to}}, orderBy: blockNumber, orderDirection: asc) {
+                    amountAdded0
+                    amountAdded1
+                    blockNumber
+                    token0
+                    token1
+                  }
+                }
+              }`
+        })
+        
+        if (result.data.data.compoundSessions.length == take) {
+            currentFrom = parseInt(result.data.data.compoundSessions[result.data.data.compoundSessions.length - 1].endBlockNumber, 10) // paging by endBlockNumber number
+        }
+
+        for (const session of result.data.data.compoundSessions) {
+            if(session.compounds.length === 1000) {
+                session.compounds = await getCompoundsPaged(session.id, from, to)
+            }
+            // do not add duplicates
+            if (!sessions.find(s => s.id == session.id)) {
+                sessions.push(session)
+            }
+        }
+        
     } while (result.data.data.compoundSessions.length == take)
   
     return sessions
@@ -81,7 +124,7 @@ async function getTokenETHPricesX96(position, blockNumber) {
         const priceX96 = slot0.sqrtPriceX96.pow(2).div(BigNumber.from(2).pow(192 - 96))
         return [tokenPrice0X96 || tokenPrice1X96.mul(priceX96).div(BigNumber.from(2).pow(96)), tokenPrice1X96 || tokenPrice0X96.mul(BigNumber.from(2).pow(96)).div(priceX96)]
     } else {
-        // TODO decide what to do here... should never happen
+        // TODO decide what to do here... should never happen - probably just return [0,0] as these are two worthless tokens
         throw Error("Couldn't find prices for position", position.token0, position.token1, position.fee)
     }
 }
@@ -179,7 +222,7 @@ async function getEstimatedFees(nftId, position, pool, from, to) {
     const firstBlock = (adds.length > 0 && (withdraws.length === 0 || adds[0].blockNumber < withdraws[0].blockNumber)) ? adds[0].blockNumber : (withdraws.length > 0 ? withdraws[0].blockNumber : null)
     const lastBlock = (adds.length > 0 && (withdraws.length === 0 || adds[adds.length - 1].blockNumber > withdraws[withdraws.length - 1].blockNumber)) ? adds[adds.length - 1].blockNumber : (withdraws.length > 0 ? withdraws[withdraws.length - 1].blockNumber : null)
 
-    // TODO for now if only one data point - return null - fees cant be c
+    // TODO for now if only one data point - return null - fees cant be calculated
     if (firstBlock == lastBlock) {
         return null
     }
@@ -237,16 +280,12 @@ async function getTimeInRange(position, pool, from, to) {
 
 function createMerkleTree(accounts) {
     const leafNodes = Object.entries(accounts).map(val => ethers.utils.keccak256(ethers.utils.defaultAbiCoder.encode([ "address", "uint256" ], [ val[0], val[1] ])))
-    // make sure its an even number - if not add dummy entry
-    if (leafNodes.length % 2 === 1) {
-        leafNodes.push(ethers.utils.defaultAbiCoder.encode([ "address", "uint256" ], [ ethers.constants.AddressZero, 0 ]))
-    }
     return new MerkleTree(leafNodes, keccak256, { sort: true });
 }
 
 async function run(startBlock, endBlock, vestingPeriod) {
 
-    const sessions = await getCompoundSessions(startBlock, endBlock)
+    const sessions = await getCompoundSessionsPaged(startBlock, endBlock)
 
     const accounts = {}
 
@@ -259,7 +298,7 @@ async function run(startBlock, endBlock, vestingPeriod) {
         const position = await npm.positions(nftId, { blockTag: from });
 
         // get all compounded fees during reward period
-        const compounds = session.compounds.filter(c => c.blockNumber >= startBlock && c.blockNumber < endBlock)
+        const compounds = session.compounds
 
         if (compounds.length > 0) {
              // get compounded and generated fees
