@@ -2,6 +2,8 @@ require('dotenv').config()
 const ethers = require("ethers");
 const axios = require('axios');
 const fs = require('fs');
+const { MerkleTree } = require("merkletreejs");
+const { keccak256 } = require('@ethersproject/keccak256');
 
 const BigNumber = ethers.BigNumber;
 
@@ -233,6 +235,15 @@ async function getTimeInRange(position, pool, from, to) {
     return (2 ** 32 + snapTo.secondsInside - snapFrom.secondsInside) % 2 ** 32
 }
 
+function createMerkleTree(accounts) {
+    const leafNodes = Object.entries(accounts).map(val => ethers.utils.keccak256(ethers.utils.defaultAbiCoder.encode([ "address", "uint256" ], [ val[0], val[1] ])))
+    // make sure its an even number - if not add dummy entry
+    if (leafNodes.length % 2 === 1) {
+        leafNodes.push(ethers.utils.defaultAbiCoder.encode([ "address", "uint256" ], [ ethers.constants.AddressZero, 0 ]))
+    }
+    return new MerkleTree(leafNodes, keccak256, { sort: true });
+}
+
 async function run(startBlock, endBlock, vestingPeriod) {
 
     const sessions = await getCompoundSessions(startBlock, endBlock)
@@ -275,6 +286,9 @@ async function run(startBlock, endBlock, vestingPeriod) {
             }
         }
     }
+
+    const merkleTree = createMerkleTree(accounts)
+    console.log(merkleTree.getHexRoot())
 
     const content = Object.entries(accounts).map(val => val[0] + "," + val[1].toString()).join("\n")
     fs.writeFileSync(process.env.FILE_NAME, content)
