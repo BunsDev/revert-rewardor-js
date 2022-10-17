@@ -149,6 +149,8 @@ async function getTokenETHPriceX96(address, blockNumber) {
     return price
 }
 
+// find highest liquidity pool for ETH / TOKEN with min balance check
+// for optimization the first pool found is cached - this is not recalculated for each block
 async function findPricePoolForToken(address, blockNumber) {
 
     if (pricePoolCache[address]) {
