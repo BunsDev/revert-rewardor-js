@@ -4,7 +4,7 @@ const axios = require('axios');
 const fs = require('fs');
 const { MerkleTree } = require("merkletreejs");
 const { keccak256 } = require('@ethersproject/keccak256');
-
+const BigDecimal = require('big.js');
 const BigNumber = ethers.BigNumber;
 
 const IERC20_ABI = require("./contracts/IERC20.json")
@@ -20,18 +20,48 @@ const provider = new ethers.providers.JsonRpcProvider(process.env.RPC_URL)
 const factory = new ethers.Contract(factoryAddress, FACTORY_RAW.abi, provider)
 const npm = new ethers.Contract(npmAddress, NPM_RAW.abi, provider)
 
-const nativeTokenAddresses = {
-    "mainnet": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
-    "polygon": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270",
-    "optimism": "0x4200000000000000000000000000000000000006",
-    "arbitrum": "0x82af49447d8a07e3bd95bd0d56f35241523fbab1"
+const network = process.env.NETWORK
+const graphApiUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/compoundor-" + network
+const uniswapGraphApiUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/uniswap-v3-" + network
+
+const priceCache = {}
+const decimalsCache = {}
+
+async function getTokenDecimalsCached(token) {
+    if (!decimalsCache[token]) {
+        const contract = new ethers.Contract(token, IERC20_ABI, provider)
+        decimalsCache[token] = await contract.decimals()
+    }
+    return decimalsCache[token]
 }
 
-const network = process.env.NETWORK
-const nativeTokenAddress = nativeTokenAddresses[network]
-const graphApiUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/compoundor-" + network
+async function getTokenPricesAtBlocksPagedCached(token, blocks) {
+    
+    token = token.toLowerCase()
 
-const pricePoolCache = {}
+    if (!priceCache[token]) {
+        priceCache[token] = {}
+    }
+
+    const take = 100
+    let result
+    let missingBlocks = blocks.filter(b => !priceCache[token][b])
+    let queries = missingBlocks.map(b => `price_${b}: token(block: { number: ${b}}, id: "${token}") { derivedETH }`)
+
+    let start = 0
+    while(start < queries.length) {
+        result = await axios.post(uniswapGraphApiUrl, {
+            query: `{ ${queries.slice(start, start + take).join(" ")} }`  
+        })
+        Object.entries(result.data.data).forEach(([k, v]) => priceCache[token][k.substr(6)] = BigDecimal(v.derivedETH))
+        start += take
+    }
+
+    const prices = {}
+    blocks.forEach(b => prices[b] = priceCache[token][b])
+
+    return prices
+}
 
 // in the case of sessions with too many compounds - do paging
 async function getCompoundsPaged(sessionId, from, to) {
@@ -109,83 +139,6 @@ async function getCompoundSessionsPaged(from, to) {
     return sessions
 }
 
-async function getTokenETHPricesX96(position, blockNumber) {
-
-    const tokenPrice0X96 = await getTokenETHPriceX96(position.token0, blockNumber)
-    const tokenPrice1X96 = await getTokenETHPriceX96(position.token1, blockNumber)
-
-    if (tokenPrice0X96 && tokenPrice1X96) {
-        return [tokenPrice0X96, tokenPrice1X96]
-    } else if (tokenPrice0X96 || tokenPrice1X96) {
-        // if only one has ETH pair - calculate other with pool price
-        const poolAddress = await factory.getPool(position.token0, position.token1, position.fee, { blockTag: blockNumber });
-        const poolContract = new ethers.Contract(poolAddress, POOL_RAW.abi, provider)
-        const slot0 = await poolContract.slot0({ blockTag: blockNumber })
-        const priceX96 = slot0.sqrtPriceX96.pow(2).div(BigNumber.from(2).pow(192 - 96))
-        return [tokenPrice0X96 || tokenPrice1X96.mul(priceX96).div(BigNumber.from(2).pow(96)), tokenPrice1X96 || tokenPrice0X96.mul(BigNumber.from(2).pow(96)).div(priceX96)]
-    } else {
-        // TODO decide what to do here... should never happen - probably just return [0,0] as these are two worthless tokens
-        throw Error("Couldn't find prices for position", position.token0, position.token1, position.fee)
-    }
-}
-
-async function getTokenETHPriceX96(address, blockNumber) {
-    if (address.toLowerCase() == nativeTokenAddress.toLowerCase()) {
-        return BigNumber.from(2).pow(96);
-    }
-
-
-    let price = null
-
-    const pricePool = await findPricePoolForToken(address, blockNumber)
-    if (pricePool.address > 0) {
-        const poolContract = new ethers.Contract(pricePool.address, POOL_RAW.abi, provider)
-        const slot0 = await poolContract.slot0({ blockTag: blockNumber })
-        if (slot0.sqrtPriceX96.gt(0)) {
-            price = pricePool.isToken1WETH ? slot0.sqrtPriceX96.pow(2).div(BigNumber.from(2).pow(192 - 96)) : BigNumber.from(2).pow(192 + 96).div(slot0.sqrtPriceX96.pow(2))
-        }
-    }
-
-    return price
-}
-
-// find highest liquidity pool for ETH / TOKEN with min balance check
-// for optimization the first pool found is cached - this is not recalculated for each block
-async function findPricePoolForToken(address, blockNumber) {
-
-    if (pricePoolCache[address]) {
-        return pricePoolCache[address]
-    }
-
-    const minimalBalanceETH = BigNumber.from(10).pow(18) // 1 ETH
-    let maxBalanceETH = BigNumber.from(0)
-    let pricePoolAddress = null
-    let isToken1WETH = null
-
-    const nativeToken = new ethers.Contract(nativeTokenAddress, IERC20_ABI, provider)
-
-    for (let fee of [100, 500, 3000, 10000]) {
-        const candidatePricePoolAddress = await factory.getPool(address, nativeTokenAddress, fee, { blockTag: blockNumber })
-        if (candidatePricePoolAddress > 0) {
-            const poolContract = new ethers.Contract(candidatePricePoolAddress, POOL_RAW.abi, provider)
-
-            const balanceETH = (await nativeToken.balanceOf(candidatePricePoolAddress, { blockTag: blockNumber }))
-            if (balanceETH.gt(maxBalanceETH) && balanceETH.gte(minimalBalanceETH)) {
-                pricePoolAddress = candidatePricePoolAddress
-                maxBalanceETH = balanceETH
-                if (isToken1WETH === null) {
-                    isToken1WETH = (await poolContract.token1()).toLowerCase() == nativeTokenAddress.toLowerCase();
-                }
-            }
-           
-        }
-    }
-
-    pricePoolCache[address] = { address: pricePoolAddress, isToken1WETH }
-
-    return pricePoolCache[address]
-}
-
 async function averageFeeGrowthPerBlock(position, pool, from, to) {
 
     const positionKey = ethers.utils.solidityKeccak256([ "address", "int24", "int24" ], [ npmAddress, position.tickLower, position.tickUpper ])
@@ -199,11 +152,10 @@ async function averageFeeGrowthPerBlock(position, pool, from, to) {
     return { fee0, fee1 }
 }
 
-async function calculateFees(position, from, to, avgFeeGrowth, liquidity) {
-    const prices = await getTokenETHPricesX96(position, to)
+async function calculateFees(from, to, avgFeeGrowth, liquidity, prices0, prices1) {
     const fees0 = avgFeeGrowth.fee0.mul(to - from).mul(liquidity).div(BigNumber.from(2).pow(128))
     const fees1 = avgFeeGrowth.fee1.mul(to - from).mul(liquidity).div(BigNumber.from(2).pow(128))
-    return prices[0].mul(fees0).div(BigNumber.from(2).pow(96)).add(prices[1].mul(fees1).div(BigNumber.from(2).pow(96)))
+    return prices0[to].times(fees0).plus(prices1[to].times(fees1))
 }
 
 async function getEstimatedFees(nftId, position, pool, from, to) {
@@ -231,44 +183,55 @@ async function getEstimatedFees(nftId, position, pool, from, to) {
 
     const avgFeeGrowth = await averageFeeGrowthPerBlock(position, pool, firstBlock, lastBlock)
 
+    const blocks = [...new Set(adds.map(a => a.blockNumber).concat(withdraws.map(a => a.blockNumber).concat([to])))]
+    const prices0 = await getTokenPricesAtBlocksPagedCached(position.token0, blocks)
+    const prices1 = await getTokenPricesAtBlocksPagedCached(position.token1, blocks)
+
     let addIndex = 0
     let withdrawIndex = 0
     let currentBlock = from
     let currentLiquidity = position.liquidity
     
-    let fees = BigNumber.from(0)
+    let fees = BigDecimal(0)
 
     while (addIndex < adds.length || withdrawIndex < withdraws.length) {
         const nextAdd = addIndex < adds.length ? adds[addIndex] : null
         const nextWithdraw = withdrawIndex < withdraws.length ? withdraws[withdrawIndex] : null
 
         if (nextAdd && (!nextWithdraw || nextAdd.blockNumber <= nextWithdraw.blockNumber)) {
-            const f = await calculateFees(position, currentBlock, nextAdd.blockNumber, avgFeeGrowth, currentLiquidity)
-            fees = fees.add(f)
+            const f = await calculateFees(currentBlock, nextAdd.blockNumber, avgFeeGrowth, currentLiquidity, prices0, prices1)
+            fees = fees.plus(f)
             addIndex++
             currentBlock = nextAdd.blockNumber
             currentLiquidity = currentLiquidity.add(npm.interface.parseLog(nextAdd).args.liquidity)
         } else {
-            const f = await calculateFees(position, currentBlock, nextWithdraw.blockNumber, avgFeeGrowth, currentLiquidity)
-            fees = fees.add(f)
+            const f = await calculateFees(currentBlock, nextWithdraw.blockNumber, avgFeeGrowth, currentLiquidity, prices0, prices1)
+            fees = fees.plus(f)
             withdrawIndex++
             currentBlock = nextWithdraw.blockNumber
             currentLiquidity = currentLiquidity.sub(npm.interface.parseLog(nextWithdraw).args.liquidity)
         }
     }
 
-    const f = await calculateFees(position, currentBlock, to, avgFeeGrowth, currentLiquidity)
-    fees = fees.add(f)
+    const f = await calculateFees(currentBlock, to, avgFeeGrowth, currentLiquidity, prices0, prices1)
+    fees = fees.plus(f)
 
     return fees
 }
 
 async function getAutoCompoundedFees(position, compounds) {
-    let fees = BigNumber.from(0)
+    let fees = BigDecimal(0)
     if (compounds.length > 0) {
+        const blocks = compounds.map(c => c.blockNumber)
+        const prices0 = await getTokenPricesAtBlocksPagedCached(position.token0, blocks)
+        const prices1 = await getTokenPricesAtBlocksPagedCached(position.token1, blocks)
+        const decimals0 = await getTokenDecimalsCached(position.token0)
+        const decimals1 = await getTokenDecimalsCached(position.token1)
+
         for (const compound of compounds) {
-            const prices = await getTokenETHPricesX96(position, parseInt(compound.blockNumber, 10))
-            fees = fees.add(prices[0].mul(compound.amountAdded0).div(BigNumber.from(2).pow(96)).add(prices[1].mul(compound.amountAdded1).div(BigNumber.from(2).pow(96))))
+            const amount0 = BigDecimal(compound.amountAdded0).div(BigDecimal(10).pow(decimals0))
+            const amount1 = BigDecimal(compound.amountAdded1).div(BigDecimal(10).pow(decimals1))
+            fees = fees.plus(prices0[compound.blockNumber].times(amount0).plus(prices1[compound.blockNumber].times(amount1)))
         }
     } 
     return fees
@@ -280,8 +243,8 @@ async function getTimeInRange(position, pool, from, to) {
     return (2 ** 32 + snapTo.secondsInside - snapFrom.secondsInside) % 2 ** 32
 }
 
-function createMerkleTree(accounts) {
-    const leafNodes = Object.entries(accounts).map(val => ethers.utils.keccak256(ethers.utils.defaultAbiCoder.encode([ "address", "uint256" ], [ val[0], val[1] ])))
+function createMerkleTree(finalRewards) {
+    const leafNodes = finalRewards.map(f => ethers.utils.keccak256(ethers.utils.defaultAbiCoder.encode([ "address", "uint256" ], [ f.account, f.reward ])))
     return new MerkleTree(leafNodes, keccak256, { sort: true });
 }
 
@@ -317,22 +280,32 @@ async function run(startBlock, endBlock, vestingPeriod) {
 
             // apply vesting period
             if (timeInRange < vestingPeriod) {
-                amount = amount.mul(timeInRange).div(vestingPeriod)
+                amount = amount.times(timeInRange).div(vestingPeriod)
             }
 
             if (!accounts[session.account]) {
                 accounts[session.account] = amount
             } else {
-                accounts[session.account] = accounts[session.account].add(amount)
+                accounts[session.account] = accounts[session.account].plus(amount)
             }
         }
     }
 
-    const merkleTree = createMerkleTree(accounts)
+    const totalReward = BigDecimal(process.env.TOTAL_REWARD)
+    const total = Object.values(accounts).reduce((a, c) => a.plus(c), BigDecimal(0))
+
+    const finalRewards = Object.entries(accounts).map(([account, amount]) => (
+        {   
+            account, 
+            reward: BigNumber.from(totalReward.times(amount.div(total)).round(0, 0).toString())
+        }))
+    
+    const merkleTree = increateMerkleTree(finalRewards)
     console.log(merkleTree.getHexRoot())
 
-    const content = Object.entries(accounts).map(val => val[0] + "," + val[1].toString()).join("\n")
+    const content = finalRewards.map(f => f.account + "," + f.reward.toString()).join("\n")
     fs.writeFileSync(process.env.FILE_NAME, content)
 }
+
 
 run(parseInt(process.env.START_BLOCK), parseInt(process.env.END_BLOCK), parseInt(process.env.VESTING_PERIOD))
