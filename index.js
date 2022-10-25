@@ -40,7 +40,7 @@ async function run(startBlock, endBlock, vestingPeriod) {
     console.log("Processing", sessions.length, "Sessions")
 
     // create table of all valid compounded amounts per account
-    for (const session of sessions) {
+    for (const session of sessions.filter(s => s.token.id == 146286)) {
         const amount = await calculateMaxCompoundedETHForSession(session, startBlock, endBlock, vestingPeriod)
         if (!accounts[session.account]) {
             accounts[session.account] = amount
@@ -63,8 +63,9 @@ async function run(startBlock, endBlock, vestingPeriod) {
     console.log(merkleTree.getHexRoot())
 
     // save table to file for reward UI usage
-    const content = finalRewards.map(f => f.account + "," + f.reward.toString()).join("\n")
-    fs.writeFileSync(process.env.FILE_NAME, content)
+    const content = {}
+    finalRewards.forEach(r => content[r.account] = r.reward.toString())
+    fs.writeFileSync(process.env.FILE_NAME, JSON.stringify(content))
 }
 
 
