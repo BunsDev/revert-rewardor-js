@@ -1,6 +1,6 @@
 # rewardor-js
 
-Script to calculate reward distribution for our revert optimism or polygon reward programs.
+Script to calculate reward distribution for revert auto-compounder rewards.
 
 ## Getting Started
 

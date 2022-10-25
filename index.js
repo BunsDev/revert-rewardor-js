@@ -41,7 +41,7 @@ async function run(startBlock, endBlock, vestingPeriod) {
 
     // create table of all valid compounded amounts per account
     for (const session of sessions) {
-        const amount = await calculateFeesForSession(session, startBlock, endBlock, vestingPeriod)
+        const amount = await calculateMaxCompoundedETHForSession(session, startBlock, endBlock, vestingPeriod)
         if (!accounts[session.account]) {
             accounts[session.account] = amount
         } else {
@@ -142,7 +142,7 @@ async function getCompoundSessionsPaged(from, to) {
     do {
         result = await axios.post(graphApiUrl, {
             query: `{
-                compoundSessions(first: ${take}, where: { endBlockNumber_gte: ${currentFrom}, startBlockNumber_lt: ${to}}, orderBy: endBlockNumber, orderDirection: asc) {
+                compoundSessions(first: ${take}, where: { endBlockNumber_gte: ${currentFrom}, startBlckNumber_lt: ${to}}, orderBy: endBlockNumber, orderDirection: asc) {
                   id
                   startBlockNumber
                   endBlockNumber
@@ -314,7 +314,7 @@ function createMerkleTree(finalRewards) {
     return new MerkleTree(leafNodes, keccak256, { sort: true });
 }
 
-async function calculateFeesForSession(session, startBlock, endBlock, vestingPeriod, retries = 0) {
+async function calculateMaxCompoundedETHForSession(session, startBlock, endBlock, vestingPeriod, retries = 0) {
 
     try {
         const from = parseInt(session.startBlockNumber, 10) < startBlock ? startBlock : parseInt(session.startBlockNumber, 10)
@@ -353,7 +353,7 @@ async function calculateFeesForSession(session, startBlock, endBlock, vestingPer
         console.log("Err retrying", err)
         if (retries < 3) {
             await new Promise(r => setTimeout(r, 30000 * (retries + 1))) // increasing delay
-            return await calculateFeesForSession(session, startBlock, endBlock, vestingPeriod, retries + 1)
+            return await calculateMaxCompoundedETHForSession(session, startBlock, endBlock, vestingPeriod, retries + 1)
         } else {
             throw err
         }
