@@ -142,7 +142,7 @@ async function getCompoundSessionsPaged(from, to) {
     do {
         result = await axios.post(graphApiUrl, {
             query: `{
-                compoundSessions(first: ${take}, where: { endBlockNumber_gte: ${currentFrom}, startBlckNumber_lt: ${to}}, orderBy: endBlockNumber, orderDirection: asc) {
+                compoundSessions(first: ${take}, where: { endBlockNumber_gte: ${currentFrom}, startBlockNumber_lt: ${to}}, orderBy: endBlockNumber, orderDirection: asc) {
                   id
                   startBlockNumber
                   endBlockNumber
