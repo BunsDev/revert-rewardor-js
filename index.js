@@ -25,6 +25,12 @@ const uniswapGraphApiUrl = "https://api.thegraph.com/subgraphs/name/revert-finan
 
 const priceCache = {}
 const decimalsCache = {}
+const symbolsCache = {}
+
+const whiteListTokens = process.env.WHITE_LIST_TOKENS.split(",").filter(i => i)
+const whiteListTokenPairs = process.env.WHITE_LIST_TOKEN_PAIRS.split(",").filter(i => i).map(p => ({ symbolA: p.split("/")[0], symbolB: p.split("/")[1] }))
+const blackListTokens = process.env.BLACK_LIST_TOKENS.split(",").filter(i => i)
+
 
 
 // execute main function with configured env variables
@@ -75,6 +81,14 @@ async function getTokenDecimalsCached(token) {
         decimalsCache[token] = await contract.decimals()
     }
     return decimalsCache[token]
+}
+
+async function getTokenSymbolCached(token) {
+    if (!symbolsCache[token]) {
+        const contract = new ethers.Contract(token, IERC20_ABI, provider)
+        symbolsCache[token] = await contract.symbol()
+    }
+    return symbolsCache[token]
 }
 
 async function getTokenPricesAtBlocksPagedCached(token, blocks) {
@@ -323,6 +337,20 @@ async function calculateMaxCompoundedETHForSession(session, startBlock, endBlock
         const nftId = parseInt(session.token.id, 10)
         const position = await npm.positions(nftId, { blockTag: from });
     
+        const symbol0 = await getTokenSymbolCached(position.token0)
+        const symbol1 = await getTokenSymbolCached(position.token1)
+
+        if (blackListTokens.find(t => symbol0 == t || symbol1 == t)) {
+            return BigDecimal(0)
+        }
+        if (whiteListTokenPairs.length > 0 && !whiteListTokenPairs.find(t => symbol0 == t.symbolA && symbol1 == t.symbolB || symbol1 == t.symbolA && symbol0 == t.symbolB)) {
+            return BigDecimal(0)
+        }
+        if (whiteListTokens.length > 0 && !whiteListTokens.find(t => symbol0 == t || symbol1 == t)) {
+            return BigDecimal(0)
+        }
+
+
         // get all compounded fees during reward period
         const compounds = session.compounds
     
@@ -337,14 +365,14 @@ async function calculateMaxCompoundedETHForSession(session, startBlock, endBlock
     
             const timeInRange = await getTimeInRange(position, pool, from, to)
     
-            console.log(nftId, compoundedFees.toString(), generatedFees.toString())
-    
             let amount = generatedFees && compoundedFees.gt(generatedFees) ? generatedFees : compoundedFees
     
             // apply vesting period
             if (timeInRange < vestingPeriod) {
                 amount = amount.times(timeInRange).div(vestingPeriod)
             }
+
+            console.log(nftId, amount.toString())
     
             return amount
         }
