@@ -6,7 +6,9 @@ const { MerkleTree } = require("merkletreejs");
 const { keccak256 } = require('@ethersproject/keccak256');
 const BigDecimal = require('big.js');
 
-BigDecimal.PE = 32 // fix wrong string formating for integer big decimals
+// fix exp string formating for integer big decimals
+BigDecimal.PE = 32
+BigDecimal.NE = -32
 
 const BigNumber = ethers.BigNumber;
 
@@ -35,8 +37,6 @@ const whiteListTokens = process.env.WHITE_LIST_TOKENS.split(",").filter(i => i)
 const whiteListTokenPairs = process.env.WHITE_LIST_TOKEN_PAIRS.split(",").filter(i => i).map(p => ({ symbolA: p.split("/")[0], symbolB: p.split("/")[1] }))
 const blackListTokens = process.env.BLACK_LIST_TOKENS.split(",").filter(i => i)
 
-
-
 // execute main function with configured env variables
 run(parseInt(process.env.START_BLOCK), parseInt(process.env.END_BLOCK), parseInt(process.env.VESTING_PERIOD))
 
@@ -44,19 +44,24 @@ run(parseInt(process.env.START_BLOCK), parseInt(process.env.END_BLOCK), parseInt
 async function run(startBlock, endBlock, vestingPeriod) {
 
     const sessions = await getCompoundSessionsPaged(startBlock, endBlock)
-    
 
+    const positions = {}
     const accounts = {}
 
     console.log("Processing", sessions.length, "Sessions")
 
-    // create table of all valid compounded amounts per account
+    // create table of all valid compounded amounts per account / per position
     for (const session of sessions) {
-        const amount = await calculateMaxCompoundedETHForSession(session, startBlock, endBlock, vestingPeriod)
+        const data = await calculateSessionData(session, startBlock, endBlock, vestingPeriod)
         if (!accounts[session.account]) {
-            accounts[session.account] = amount
+            accounts[session.account] = data.amount
         } else {
-            accounts[session.account] = accounts[session.account].plus(amount)
+            accounts[session.account] = accounts[session.account].plus(data.amount)
+        }
+        if (!positions[session.token.id]) {
+            positions[session.token.id] = { id: session.token.id, symbol0: data.symbol0, symbol1: data.symbol1, amount: data.amount, fee: data.position.fee }
+        } else {
+            positions[session.token.id].amount = positions[session.token.id].amount.plus(data.amount)
         }
     }
 
@@ -73,7 +78,11 @@ async function run(startBlock, endBlock, vestingPeriod) {
     const merkleTree = createMerkleTree(finalRewards)
     console.log(merkleTree.getHexRoot())
 
-    // save table to file for reward UI usage
+    // save table to file for position analysis
+    const infoContent = Object.values(positions).map(p => p.id + "," + p.symbol0 + "," + p.symbol1 + "," + p.fee + "," + p.amount.toString()).join("\n")
+    fs.writeFileSync(process.env.INFO_FILE_NAME, infoContent)
+
+    // save json to file for final reward UI usage
     const content = {}
     finalRewards.forEach(r => content[r.account] = r.reward.toString())
     fs.writeFileSync(process.env.FILE_NAME, JSON.stringify(content))
@@ -254,7 +263,7 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
     let firstBlock = (adds.length > 0 && (withdraws.length === 0 || adds[0].blockNumber < withdraws[0].blockNumber)) ? adds[0].blockNumber : (withdraws.length > 0 ? withdraws[0].blockNumber : null)
     const lastBlock = (adds.length > 0 && (withdraws.length === 0 || adds[adds.length - 1].blockNumber > withdraws[withdraws.length - 1].blockNumber)) ? adds[adds.length - 1].blockNumber : (withdraws.length > 0 ? withdraws[withdraws.length - 1].blockNumber : null)
 
-    // if only one data point - get previous IncreaseLiquidity/DecreaseLiquidity event
+    // if only one data point (compound) - get previous IncreaseLiquidity/DecreaseLiquidity event
     if (firstBlock == lastBlock) {
         const previousAdds = await provider.getLogs({
             fromBlock: 0,
@@ -298,36 +307,30 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
         const nextAdd = addIndex < adds.length ? adds[addIndex] : null
         const nextWithdraw = withdrawIndex < withdraws.length ? withdraws[withdrawIndex] : null
 
+        let f, l;
+
         if (nextAdd && (!nextWithdraw || nextAdd.blockNumber <= nextWithdraw.blockNumber)) {
-            const f = await calculateFees(currentBlock, nextAdd.blockNumber, avgFeeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
-            fees = fees.plus(f)
+            f = await calculateFees(currentBlock, nextAdd.blockNumber, avgFeeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
+            l = npm.interface.parseLog(nextAdd).args.liquidity
             addIndex++
             currentBlock = nextAdd.blockNumber
-            const timestamp = await getBlockTimestampCached(currentBlock)
-            const snap = await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: currentBlock })
-            liquidityLevels[currentLiquidity].secondsInside += (2 ** 32 + snap.secondsInside - lastSnap.secondsInside) % 2 ** 32
-            liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
-            currentTimestamp = timestamp
-            lastSnap = snap
-            currentLiquidity = currentLiquidity.add(npm.interface.parseLog(nextAdd).args.liquidity)
-            if (!liquidityLevels[currentLiquidity]) {
-                liquidityLevels[currentLiquidity] = { secondsInside: 0, totalSeconds: 0 }
-            }
         } else {
-            const f = await calculateFees(currentBlock, nextWithdraw.blockNumber, avgFeeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
-            fees = fees.plus(f)
+            f = await calculateFees(currentBlock, nextWithdraw.blockNumber, avgFeeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
+            l = npm.interface.parseLog(nextWithdraw).args.liquidity.mul(-1) // negate liquidity
             withdrawIndex++
             currentBlock = nextWithdraw.blockNumber
-            const timestamp = await getBlockTimestampCached(currentBlock)
-            const snap = await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: currentBlock })
-            liquidityLevels[currentLiquidity].secondsInside += (2 ** 32 + snap.secondsInside - lastSnap.secondsInside) % 2 ** 32
-            liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
-            currentTimestamp = timestamp
-            lastSnap = snap
-            currentLiquidity = currentLiquidity.sub(npm.interface.parseLog(nextWithdraw).args.liquidity)
-            if (!liquidityLevels[currentLiquidity]) {
-                liquidityLevels[currentLiquidity] = { secondsInside: 0, totalSeconds: 0 }
-            }
+        }
+
+        fees = fees.plus(f)
+        const timestamp = await getBlockTimestampCached(currentBlock)
+        const snap = await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: currentBlock })
+        liquidityLevels[currentLiquidity].secondsInside += (2 ** 32 + snap.secondsInside - lastSnap.secondsInside) % 2 ** 32
+        liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
+        currentTimestamp = timestamp
+        lastSnap = snap
+        currentLiquidity = currentLiquidity.add(l)
+        if (!liquidityLevels[currentLiquidity]) {
+            liquidityLevels[currentLiquidity] = { secondsInside: 0, totalSeconds: 0 }
         }
     }
 
@@ -339,6 +342,7 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
     liquidityLevels[currentLiquidity].secondsInside += (2 ** 32 + snap.secondsInside - lastSnap.secondsInside) % 2 ** 32
     liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
 
+    // calculate fair vesting factor considering vesting each liquidity level separately
     let vestedLiquidityTime = BigNumber.from(0)
     let totalLiquidityTime = BigNumber.from(0)
 
@@ -386,7 +390,7 @@ function createMerkleTree(finalRewards) {
     return new MerkleTree(leafNodes, keccak256, { sort: true });
 }
 
-async function calculateMaxCompoundedETHForSession(session, startBlock, endBlock, vestingPeriod, retries = 0) {
+async function calculateSessionData(session, startBlock, endBlock, vestingPeriod, retries = 0) {
 
     try {
         const from = parseInt(session.startBlockNumber, 10) < startBlock ? startBlock : parseInt(session.startBlockNumber, 10)
@@ -410,7 +414,9 @@ async function calculateMaxCompoundedETHForSession(session, startBlock, endBlock
 
         // get all compounded fees during reward period
         const compounds = session.compounds
-    
+        
+        let amount = BigDecimal(0)
+
         if (compounds.length > 0) {
              // get compounded and generated fees
             const compoundedFees = await getAutoCompoundedFees(position, compounds)
@@ -420,20 +426,18 @@ async function calculateMaxCompoundedETHForSession(session, startBlock, endBlock
     
             const data = await getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, vestingPeriod)
 
-            let amount = data.generatedFees && compoundedFees.gt(data.generatedFees) ? data.generatedFees : compoundedFees
+            amount = data.generatedFees && compoundedFees.gt(data.generatedFees) ? data.generatedFees : compoundedFees
             amount = amount.times(data.vestingFactor) // apply vesting period
 
             console.log(nftId, amount.toString())
-    
-            return amount
         }
     
-        return BigDecimal(0)
+        return { amount, symbol0, symbol1, position }
     } catch (err) {
         console.log("Err retrying", err)
         if (retries < 3) {
             await new Promise(r => setTimeout(r, 30000 * (retries + 1))) // increasing delay
-            return await calculateMaxCompoundedETHForSession(session, startBlock, endBlock, vestingPeriod, retries + 1)
+            return await calculateSessionData(session, startBlock, endBlock, vestingPeriod, retries + 1)
         } else {
             throw err
         }
