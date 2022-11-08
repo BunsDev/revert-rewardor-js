@@ -323,11 +323,15 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
 
         fees = fees.plus(f)
         const timestamp = await getBlockTimestampCached(currentBlock)
-        const snap = await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: currentBlock })
+
+        // for special case where liquidity goes from 0 to non0 or vice versa
+        const fixedBlockNumber = currentLiquidity.add(l).eq(0) ? currentBlock - 1 : (currentLiquidity.eq(0) ? currentBlock + 1 : currentBlock)
+
+        const snap = await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: fixedBlockNumber })
         liquidityLevels[currentLiquidity].secondsInside += (2 ** 32 + snap.secondsInside - lastSnap.secondsInside) % 2 ** 32
         liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
         currentTimestamp = timestamp
-        lastSnap = snap
+        lastSnap = snap        
         currentLiquidity = currentLiquidity.add(l)
         if (!liquidityLevels[currentLiquidity]) {
             liquidityLevels[currentLiquidity] = { secondsInside: 0, totalSeconds: 0 }
@@ -337,10 +341,12 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
     const f = await calculateFees(currentBlock, to, avgFeeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
     fees = fees.plus(f)
 
-    const timestamp = await getBlockTimestampCached(to)
-    const snap = await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: to })
-    liquidityLevels[currentLiquidity].secondsInside += (2 ** 32 + snap.secondsInside - lastSnap.secondsInside) % 2 ** 32
-    liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
+    if (currentLiquidity.gt(0)) {
+        const timestamp = await getBlockTimestampCached(to)
+        const snap = await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: to })
+        liquidityLevels[currentLiquidity].secondsInside += (2 ** 32 + snap.secondsInside - lastSnap.secondsInside) % 2 ** 32
+        liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
+    }
 
     // calculate fair vesting factor considering vesting each liquidity level separately
     let vestedLiquidityTime = BigNumber.from(0)
@@ -434,7 +440,7 @@ async function calculateSessionData(session, startBlock, endBlock, vestingPeriod
     
         return { amount, symbol0, symbol1, position }
     } catch (err) {
-        console.log("Err retrying", err)
+        console.log("Err retrying", session.token.id, err)
         if (retries < 3) {
             await new Promise(r => setTimeout(r, 30000 * (retries + 1))) // increasing delay
             return await calculateSessionData(session, startBlock, endBlock, vestingPeriod, retries + 1)
