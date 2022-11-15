@@ -173,11 +173,11 @@ async function getCompoundSessionsPaged(from, to) {
     const sessions = []
     const take = 1000
     let result
-    let currentFrom = from
+    let currentFrom = 0
     do {
         result = await axios.post(graphApiUrl, {
             query: `{
-                compoundSessions(first: ${take}, where: { startBlockNumber_lt: ${to}}, orderBy: startBlockNumber, orderDirection: asc) {
+                compoundSessions(first: ${take}, where: { startBlockNumber_gte: ${currentFrom}, startBlockNumber_lt: ${to}}, orderBy: startBlockNumber, orderDirection: asc) {
                   id
                   startBlockNumber
                   endBlockNumber
@@ -308,14 +308,25 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
         const nextWithdraw = withdrawIndex < withdraws.length ? withdraws[withdrawIndex] : null
 
         let f, l;
+        let feeGrowth = avgFeeGrowth
 
         if (nextAdd && (!nextWithdraw || nextAdd.blockNumber <= nextWithdraw.blockNumber)) {
-            f = await calculateFees(currentBlock, nextAdd.blockNumber, avgFeeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
+            if (currentBlock != from) {
+                // uncomment for more exact fee growth calculation
+                //feeGrowth = await averageFeeGrowthPerBlock(position, pool, currentBlock, nextAdd.blockNumber);
+            }
+
+            f = await calculateFees(currentBlock, nextAdd.blockNumber, feeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
             l = npm.interface.parseLog(nextAdd).args.liquidity
             addIndex++
             currentBlock = nextAdd.blockNumber
         } else {
-            f = await calculateFees(currentBlock, nextWithdraw.blockNumber, avgFeeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
+            if (currentBlock != from) {
+                // uncomment for more exact fee growth calculation
+                //feeGrowth = await averageFeeGrowthPerBlock(position, pool, currentBlock, nextWithdraw.blockNumber);
+            }
+
+            f = await calculateFees(currentBlock, nextWithdraw.blockNumber, feeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
             l = npm.interface.parseLog(nextWithdraw).args.liquidity.mul(-1) // negate liquidity
             withdrawIndex++
             currentBlock = nextWithdraw.blockNumber
