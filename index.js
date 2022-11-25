@@ -431,6 +431,11 @@ async function calculateSessionData(session, startBlock, endBlock, vestingPeriod
     
             const data = await getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, vestingPeriod)
 
+            // to be sure
+            if (data.generatedFees.lt(0) || compoundedFees.lt(0)) {
+                throw Error("Invalid fees for token: ", session.token.id)
+            }
+
             amount = data.generatedFees && compoundedFees.gt(data.generatedFees) ? data.generatedFees : compoundedFees
             amount = amount.times(data.vestingFactor) // apply vesting period
 
