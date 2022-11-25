@@ -31,9 +31,9 @@ const decimalsCache = {}
 const symbolsCache = {}
 const timestampCache = {}
 
-const whiteListTokens = process.env.WHITE_LIST_TOKENS.split(",").filter(i => i)
-const whiteListTokenPairs = process.env.WHITE_LIST_TOKEN_PAIRS.split(",").filter(i => i).map(p => ({ symbolA: p.split("/")[0], symbolB: p.split("/")[1] }))
-const blackListTokens = process.env.BLACK_LIST_TOKENS.split(",").filter(i => i)
+const includeListTokens = process.env.INCLUDE_LIST_TOKENS.split(",").filter(i => i)
+const includeListTokenPairs = process.env.INCLUDE_LIST_TOKEN_PAIRS.split(",").filter(i => i).map(p => ({ symbolA: p.split("/")[0], symbolB: p.split("/")[1] }))
+const excludeListTokens = process.env.EXCLUDE_LIST_TOKENS.split(",").filter(i => i)
 
 // execute main function with configured env variables
 run(parseInt(process.env.START_BLOCK), parseInt(process.env.END_BLOCK), parseInt(process.env.VESTING_PERIOD))
@@ -407,13 +407,13 @@ async function calculateSessionData(session, startBlock, endBlock, vestingPeriod
         const symbol0 = await getTokenSymbolCached(position.token0)
         const symbol1 = await getTokenSymbolCached(position.token1)
 
-        if (blackListTokens.find(t => symbol0 == t || symbol1 == t)) {
+        if (excludeListTokens.find(t => symbol0 == t || symbol1 == t)) {
             return BigDecimal(0)
         }
-        if (whiteListTokenPairs.length > 0 && !whiteListTokenPairs.find(t => symbol0 == t.symbolA && symbol1 == t.symbolB || symbol1 == t.symbolA && symbol0 == t.symbolB)) {
+        if (includeListTokenPairs.length > 0 && !includeListTokenPairs.find(t => symbol0 == t.symbolA && symbol1 == t.symbolB || symbol1 == t.symbolA && symbol0 == t.symbolB)) {
             return BigDecimal(0)
         }
-        if (whiteListTokens.length > 0 && !whiteListTokens.find(t => symbol0 == t || symbol1 == t)) {
+        if (includeListTokens.length > 0 && !includeListTokens.find(t => symbol0 == t || symbol1 == t)) {
             return BigDecimal(0)
         }
 
