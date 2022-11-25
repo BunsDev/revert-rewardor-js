@@ -2,8 +2,6 @@ require('dotenv').config()
 const ethers = require("ethers");
 const axios = require('axios');
 const fs = require('fs');
-const { MerkleTree } = require("merkletreejs");
-const { keccak256 } = require('@ethersproject/keccak256');
 const BigDecimal = require('big.js');
 
 // fix exp string formating for integer big decimals
@@ -73,16 +71,12 @@ async function run(startBlock, endBlock, vestingPeriod) {
             account, 
             reward: BigNumber.from(totalReward.times(amount.div(total)).round(0, 0).toString())
         })).filter(x => x.reward.gt(0))
-    
-    // calculate merkle root for resulting table
-    const merkleTree = createMerkleTree(finalRewards)
-    console.log(merkleTree.getHexRoot())
 
     // save table to file for position analysis
     const infoContent = Object.values(positions).map(p => p.id + "," + p.symbol0 + "," + p.symbol1 + "," + p.fee + "," + p.amount.toString()).join("\n")
     fs.writeFileSync(process.env.INFO_FILE_NAME, infoContent)
 
-    // save json to file for final reward UI usage
+    // save json to file for merkle tree construction
     const content = {}
     finalRewards.forEach(r => content[r.account] = r.reward.toString())
     fs.writeFileSync(process.env.FILE_NAME, JSON.stringify(content))
@@ -402,11 +396,6 @@ async function getAutoCompoundedFees(position, compounds) {
     return fees
 }
 
-function createMerkleTree(finalRewards) {
-    const leafNodes = finalRewards.map(f => ethers.utils.keccak256(ethers.utils.defaultAbiCoder.encode([ "address", "uint256" ], [ f.account, f.reward ])))
-    return new MerkleTree(leafNodes, keccak256, { sort: true });
-}
-
 async function calculateSessionData(session, startBlock, endBlock, vestingPeriod, retries = 0) {
 
     try {
@@ -428,7 +417,6 @@ async function calculateSessionData(session, startBlock, endBlock, vestingPeriod
             return BigDecimal(0)
         }
 
-
         // get all compounded fees during reward period
         const compounds = session.compounds
         
@@ -446,7 +434,7 @@ async function calculateSessionData(session, startBlock, endBlock, vestingPeriod
             amount = data.generatedFees && compoundedFees.gt(data.generatedFees) ? data.generatedFees : compoundedFees
             amount = amount.times(data.vestingFactor) // apply vesting period
 
-            console.log(nftId, amount.toString())
+            console.log(nftId, compounds.length, amount.toString())
         }
     
         return { amount, symbol0, symbol1, position }
