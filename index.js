@@ -7,13 +7,14 @@ const BigDecimal = require('big.js');
 // fix exp string formating for integer big decimals
 BigDecimal.PE = 32
 BigDecimal.NE = -32
+BigDecimal.RM = 0 // round down always
 
 const BigNumber = ethers.BigNumber;
 
 const IERC20_ABI = require("./contracts/IERC20.json")
 const NPM_RAW = require("./contracts/INonfungiblePositionManager.json")
 const FACTORY_RAW = require("./contracts/IUniswapV3Factory.json")
-const POOL_RAW = require("./contracts/IUniswapV3Pool.json")
+const POOL_RAW = require("./contracts/IUniswapV3Pool.json");
 
 const provider = new ethers.providers.JsonRpcProvider(process.env.RPC_URL)
 
@@ -23,7 +24,7 @@ const npmAddress = "0xC36442b4a4522E871399CD717aBDD847Ab11FE88"
 const npm = new ethers.Contract(npmAddress, NPM_RAW.abi, provider)
 
 const network = process.env.NETWORK
-const graphApiUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/compoundor-" + network
+const compoundorGraphApiUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/compoundor-" + network
 const uniswapGraphApiUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/uniswap-v3-" + network
 
 const priceCache = {}
@@ -140,7 +141,7 @@ async function getCompoundsPaged(sessionId, from, to) {
     let result
 
     do {
-        result = await axios.post(graphApiUrl, {
+        result = await axios.post(compoundorGraphApiUrl, {
             query: `{
                 compoundSession(id: "${sessionId}") {
                   compounds(first:${take}, where: { blockNumber_gte: ${from}, blockNumber_lt: ${to}}, orderBy: blockNumber, orderDirection: asc) {
@@ -169,7 +170,7 @@ async function getCompoundSessionsPaged(from, to) {
     let result
     let currentFrom = 0
     do {
-        result = await axios.post(graphApiUrl, {
+        result = await axios.post(compoundorGraphApiUrl, {
             query: `{
                 compoundSessions(first: ${take}, where: { startBlockNumber_gte: ${currentFrom}, startBlockNumber_lt: ${to}}, orderBy: startBlockNumber, orderDirection: asc) {
                   id
@@ -306,8 +307,7 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
 
         if (nextAdd && (!nextWithdraw || nextAdd.blockNumber <= nextWithdraw.blockNumber)) {
             if (currentBlock != from) {
-                // uncomment for more exact fee growth calculation
-                //feeGrowth = await averageFeeGrowthPerBlock(position, pool, currentBlock, nextAdd.blockNumber);
+                feeGrowth = await averageFeeGrowthPerBlock(position, pool, currentBlock, nextAdd.blockNumber);
             }
 
             f = await calculateFees(currentBlock, nextAdd.blockNumber, feeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
@@ -316,8 +316,7 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
             currentBlock = nextAdd.blockNumber
         } else {
             if (currentBlock != from) {
-                // uncomment for more exact fee growth calculation
-                //feeGrowth = await averageFeeGrowthPerBlock(position, pool, currentBlock, nextWithdraw.blockNumber);
+                feeGrowth = await averageFeeGrowthPerBlock(position, pool, currentBlock, nextWithdraw.blockNumber);
             }
 
             f = await calculateFees(currentBlock, nextWithdraw.blockNumber, feeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
@@ -357,10 +356,12 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
     let vestedLiquidityTime = BigNumber.from(0)
     let totalLiquidityTime = BigNumber.from(0)
 
-    const liquidities = Object.keys(liquidityLevels).map(BigNumber.from).sort((a, b) => a.eq(b) ? 0 : a.lt(b)? -1 : 1)
+    const liquidities = Object.keys(liquidityLevels).map(BigNumber.from).sort((a, b) => a.eq(b) ? 0 : a.lt(b) ? -1 : 1)
     let previousLiquidity = BigNumber.from(0)
     for (const liquidity of liquidities) {
         const liquidityDelta = liquidity.sub(previousLiquidity)
+
+        // calculate sum of secondinside and totalseconds from this level and all levels with higher liquidity
         const secondsInside = Object.entries(liquidityLevels).filter(ll => BigNumber.from(ll[0]).gte(liquidity)).reduce((acc, ll) => acc + ll[1].secondsInside, 0)
         const totalSeconds = Object.entries(liquidityLevels).filter(ll => BigNumber.from(ll[0]).gte(liquidity)).reduce((acc, ll) => acc + ll[1].totalSeconds, 0)
         
@@ -444,6 +445,7 @@ async function calculateSessionData(session, startBlock, endBlock, vestingPeriod
     
         return { amount, symbol0, symbol1, position }
     } catch (err) {
+        // retry handling for rare temporary errors from alchemy rpc endpoint
         console.log("Err retrying", session.token.id, err)
         if (retries < 3) {
             await new Promise(r => setTimeout(r, 30000 * (retries + 1))) // increasing delay
