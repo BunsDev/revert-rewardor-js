@@ -210,11 +210,13 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
     let liquidityLevels = {}
     liquidityLevels[currentLiquidity] = { secondsInside: 0, totalSeconds: 0 } 
 
-    const fees = await npm.callStatic.collect([nftId, npmAddress, BigNumber.from(2).pow(128).sub(1), BigNumber.from(2).pow(128).sub(1)], { blockTag: to, from: compoundorAddress })  
+    const fees = {}
+
+    const finalFees = await npm.callStatic.collect([nftId, npmAddress, BigNumber.from(2).pow(128).sub(1), BigNumber.from(2).pow(128).sub(1)], { blockTag: to, from: compoundorAddress })  
     const initialFees = await npm.callStatic.collect([nftId, npmAddress, BigNumber.from(2).pow(128).sub(1), BigNumber.from(2).pow(128).sub(1)], { blockTag: from, from: compoundorAddress })
     
-    fees.amount0 = fees.amount0.sub(initialFees.amount0)
-    fees.amount1 = fees.amount1.sub(initialFees.amount1)
+    fees.amount0 = finalFees.amount0.sub(initialFees.amount0)
+    fees.amount1 = finalFees.amount1.sub(initialFees.amount1)
 
     for (const collect of collects) {
         fees.amount0 = fees.amount0.add(npm.interface.parseLog(collect).args.amount0)
