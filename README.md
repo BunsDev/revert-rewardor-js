@@ -44,4 +44,4 @@ node index.js
 ```
 
 
-[1] For Optimism: [revert-finance/compoundor-optimism](https://thegraph.com/hosted-service/subgraph/revert-finance/uniswap-v3-polygon)
+[1] For Optimism: [revert-finance/compoundor-optimism](https://thegraph.com/hosted-service/subgraph/revert-finance/uniswap-v3-optimism)
