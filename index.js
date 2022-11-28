@@ -144,7 +144,7 @@ async function getCompoundsPaged(sessionId, from, to) {
         result = await axios.post(compoundorGraphApiUrl, {
             query: `{
                 compoundSession(id: "${sessionId}") {
-                  compounds(first:${take}, where: { blockNumber_gte: ${from}, blockNumber_lt: ${to}}, orderBy: blockNumber, orderDirection: asc) {
+                  compounds(first:${take}, where: { blockNumber_gte: ${from}, blockNumber_lte: ${to}}, orderBy: blockNumber, orderDirection: asc) {
                     amountAdded0
                     amountAdded1
                     blockNumber
@@ -180,7 +180,7 @@ async function getCompoundSessionsPaged(from, to) {
                   token {
                     id
                   }
-                  compounds(first:1000, where: { blockNumber_gte: ${from}, blockNumber_lt: ${to}}, orderBy: blockNumber, orderDirection: asc) {
+                  compounds(first:1000, where: { blockNumber_gte: ${from}, blockNumber_lte: ${to}}, orderBy: blockNumber, orderDirection: asc) {
                     amountAdded0
                     amountAdded1
                     blockNumber
