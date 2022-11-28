@@ -1,28 +1,28 @@
 require('dotenv').config()
-const ethers = require("ethers");
-const axios = require('axios');
-const fs = require('fs');
-const BigDecimal = require('big.js');
+const ethers = require("ethers")
+const axios = require('axios')
+const fs = require('fs')
+const BigDecimal = require('big.js')
 
 // fix exp string formating for integer big decimals
 BigDecimal.PE = 32
 BigDecimal.NE = -32
 BigDecimal.RM = 0 // round down always
 
-const BigNumber = ethers.BigNumber;
+const BigNumber = ethers.BigNumber
 
 const IERC20_ABI = require("./contracts/IERC20.json")
 const NPM_RAW = require("./contracts/INonfungiblePositionManager.json")
 const FACTORY_RAW = require("./contracts/IUniswapV3Factory.json")
-const POOL_RAW = require("./contracts/IUniswapV3Pool.json");
+const POOL_RAW = require("./contracts/IUniswapV3Pool.json")
 
 const provider = new ethers.providers.JsonRpcProvider(process.env.RPC_URL)
 
-const compoundorAddress = "0x5411894842e610c4d0f6ed4c232da689400f94a1"
 const factoryAddress = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
 const factory = new ethers.Contract(factoryAddress, FACTORY_RAW.abi, provider)
 const npmAddress = "0xC36442b4a4522E871399CD717aBDD847Ab11FE88"
 const npm = new ethers.Contract(npmAddress, NPM_RAW.abi, provider)
+const compoundorAddress = "0x5411894842e610c4d0f6ed4c232da689400f94a1"
 
 const network = process.env.NETWORK
 const compoundorGraphApiUrl = "https://api.thegraph.com/subgraphs/name/revert-finance/compoundor-" + network
@@ -69,8 +69,8 @@ async function run(startBlock, endBlock, vestingPeriod) {
     const totalReward = BigDecimal(process.env.TOTAL_REWARD)
     const total = Object.values(accounts).reduce((a, c) => a.plus(c), BigDecimal(0))
     const finalRewards = Object.entries(accounts).map(([account, amount]) => (
-        {   
-            account, 
+        {
+            account,
             reward: BigNumber.from(totalReward.times(amount.div(total)).round(0, 0).toString())
         })).filter(x => x.reward.gt(0))
 
@@ -108,7 +108,7 @@ async function getTokenSymbolCached(token) {
 }
 
 async function getTokenPricesAtBlocksPagedCached(token, blocks) {
-    
+
     token = token.toLowerCase()
 
     if (!priceCache[token]) {
@@ -121,9 +121,9 @@ async function getTokenPricesAtBlocksPagedCached(token, blocks) {
     let queries = missingBlocks.map(b => `price_${b}: token(block: { number: ${b}}, id: "${token}") { derivedETH }`)
 
     let start = 0
-    while(start < queries.length) {
+    while (start < queries.length) {
         result = await axios.post(uniswapGraphApiUrl, {
-            query: `{ ${queries.slice(start, start + take).join(" ")} }`  
+            query: `{ ${queries.slice(start, start + take).join(" ")} }`
         })
         Object.entries(result.data.data).forEach(([k, v]) => priceCache[token][k.substr(6)] = BigDecimal(v.derivedETH))
         start += take
@@ -154,7 +154,7 @@ async function getCompoundSessionsPaged(from, to) {
                 }
               }`
         })
-        
+
         if (result.data.data.compoundSessions.length == take) {
             currentFrom = parseInt(result.data.data.compoundSessions[result.data.data.compoundSessions.length - 1].startBlockNumber, 10) // paging by startBlockNumber number
         }
@@ -165,19 +165,17 @@ async function getCompoundSessionsPaged(from, to) {
                 sessions.push(session)
             }
         }
-        
+
     } while (result.data.data.compoundSessions.length == take)
-  
 
-
-    return sessions.filter(x => x.endBlockNumber > from || !x.endBlockNumber )
+    return sessions.filter(x => x.endBlockNumber > from || !x.endBlockNumber)
 }
 
 async function calculateValueAtBlock(amount0, amount1, prices0, prices1, decimals0, decimals1, block) {
     return prices0[block].times(amount0.toString()).div(BigDecimal(10).pow(decimals0)).plus(prices1[block].times(amount1.toString()).div(BigDecimal(10).pow(decimals1)))
 }
 
-async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, vestingPeriod) {
+async function getGeneratedVestedFees(nftId, position, pool, from, to, vestingPeriod) {
 
     const addFilter = npm.filters.IncreaseLiquidity(nftId)
     const adds = await provider.getLogs({
@@ -206,15 +204,13 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
     let currentLiquidity = position.liquidity
 
     let lastSnap = position.liquidity.gt(0) ? await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: currentBlock }) : null
-    
+
     let liquidityLevels = {}
-    liquidityLevels[currentLiquidity] = { secondsInside: 0, totalSeconds: 0 } 
+    liquidityLevels[currentLiquidity] = { secondsInside: 0, totalSeconds: 0 }
 
     const fees = {}
-
-    const finalFees = await npm.callStatic.collect([nftId, npmAddress, BigNumber.from(2).pow(128).sub(1), BigNumber.from(2).pow(128).sub(1)], { blockTag: to, from: compoundorAddress })  
     const initialFees = await npm.callStatic.collect([nftId, npmAddress, BigNumber.from(2).pow(128).sub(1), BigNumber.from(2).pow(128).sub(1)], { blockTag: from, from: compoundorAddress })
-    
+    const finalFees = await npm.callStatic.collect([nftId, npmAddress, BigNumber.from(2).pow(128).sub(1), BigNumber.from(2).pow(128).sub(1)], { blockTag: to, from: compoundorAddress })
     fees.amount0 = finalFees.amount0.sub(initialFees.amount0)
     fees.amount1 = finalFees.amount1.sub(initialFees.amount1)
 
@@ -223,24 +219,24 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
         fees.amount1 = fees.amount1.add(npm.interface.parseLog(collect).args.amount1)
     }
 
+    // process each increase and decrease liquidity event to build liquidity levels map
     while (addIndex < adds.length || withdrawIndex < withdraws.length) {
         const nextAdd = addIndex < adds.length ? adds[addIndex] : null
         const nextWithdraw = withdrawIndex < withdraws.length ? withdraws[withdrawIndex] : null
-        let f, l;
+        let liquidity
         if (nextAdd && (!nextWithdraw || nextAdd.blockNumber <= nextWithdraw.blockNumber)) {
-            l = npm.interface.parseLog(nextAdd).args.liquidity
+            liquidity = npm.interface.parseLog(nextAdd).args.liquidity
             addIndex++
             currentBlock = nextAdd.blockNumber
         } else {
             fees.amount0 = fees.amount0.sub(npm.interface.parseLog(nextWithdraw).args.amount0)
             fees.amount1 = fees.amount1.sub(npm.interface.parseLog(nextWithdraw).args.amount1)
 
-            l = npm.interface.parseLog(nextWithdraw).args.liquidity.mul(-1) // negate liquidity
+            liquidity = npm.interface.parseLog(nextWithdraw).args.liquidity.mul(-1) // negate liquidity
             withdrawIndex++
             currentBlock = nextWithdraw.blockNumber
         }
 
-        
         const timestamp = await getBlockTimestampCached(currentBlock)
 
         // for special case where liquidity goes from 0 to non0 or vice versa
@@ -252,8 +248,8 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
             liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
         }
         currentTimestamp = timestamp
-        lastSnap = snap        
-        currentLiquidity = currentLiquidity.add(l)
+        lastSnap = snap
+        currentLiquidity = currentLiquidity.add(liquidity)
         if (!liquidityLevels[currentLiquidity]) {
             liquidityLevels[currentLiquidity] = { secondsInside: 0, totalSeconds: 0 }
         }
@@ -278,7 +274,7 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
         // calculate sum of secondinside and totalseconds from this level and all levels with higher liquidity
         const secondsInside = Object.entries(liquidityLevels).filter(ll => BigNumber.from(ll[0]).gte(liquidity)).reduce((acc, ll) => acc + ll[1].secondsInside, 0)
         const totalSeconds = Object.entries(liquidityLevels).filter(ll => BigNumber.from(ll[0]).gte(liquidity)).reduce((acc, ll) => acc + ll[1].totalSeconds, 0)
-        
+
         vestedLiquidityTime = vestedLiquidityTime.add(liquidityDelta.mul(totalSeconds).mul(secondsInside >= vestingPeriod ? vestingPeriod : secondsInside).div(vestingPeriod))
         totalLiquidityTime = totalLiquidityTime.add(liquidityDelta.mul(totalSeconds))
 
@@ -294,10 +290,7 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
 
     const generatedFees = await calculateValueAtBlock(fees.amount0, fees.amount1, prices0, prices1, decimals0, decimals1, to)
 
-    return {
-        generatedFees: generatedFees,
-        vestingFactor
-    }
+    return generatedFees.times(vestingFactor)
 }
 
 async function calculateSessionData(session, startBlock, endBlock, vestingPeriod, retries = 0) {
@@ -306,8 +299,8 @@ async function calculateSessionData(session, startBlock, endBlock, vestingPeriod
         const from = parseInt(session.startBlockNumber, 10) < startBlock ? startBlock : parseInt(session.startBlockNumber, 10)
         const to = parseInt(session.endBlockNumber || ((endBlock + 1) + ""), 10) > endBlock ? endBlock : (parseInt(session.endBlockNumber, 10) - 1) // one block before removing from autocompounder - because of owner change
         const nftId = parseInt(session.token.id, 10)
-        const position = await npm.positions(nftId, { blockTag: from });
-    
+        const position = await npm.positions(nftId, { blockTag: from })
+
         const symbol0 = await getTokenSymbolCached(position.token0)
         const symbol1 = await getTokenSymbolCached(position.token1)
 
@@ -320,24 +313,18 @@ async function calculateSessionData(session, startBlock, endBlock, vestingPeriod
         if (includeListTokens.length > 0 && !includeListTokens.find(t => symbol0 == t || symbol1 == t)) {
             return BigDecimal(0)
         }
-        
-        let amount = BigDecimal(0)
 
         const poolAddress = await factory.getPool(position.token0, position.token1, position.fee, { blockTag: from })
         const pool = new ethers.Contract(poolAddress, POOL_RAW.abi, provider)
 
-        const data = await getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, vestingPeriod)
+        const amount = await getGeneratedVestedFees(nftId, position, pool, from, to, vestingPeriod)
 
-        // can happen in rare cases when price in unfavorable for fees
-        if (data.generatedFees.lt(0)) {
-            throw Error("Invalid fees for token: ", session.token.id, data.generatedFees.toString())
+        // this should never happen - if it does needs fix
+        if (amount.lt(0)) {
+            throw Error("Invalid fees for token: ", session.token.id, amount.toString())
         }
 
-        //amount = data.generatedFees && compoundedFees.gt(data.generatedFees) ? data.generatedFees : compoundedFees
-        amount = data.generatedFees
-        
-        amount = amount.times(data.vestingFactor) // apply vesting period
-
+        // log to see progress
         console.log(nftId, amount.toString())
 
         return { amount, symbol0, symbol1, position }
