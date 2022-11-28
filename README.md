@@ -1,24 +1,27 @@
 # rewardor-js
 
-Script to calculate reward distribution for revert auto-compoundor rewards. The output of this script is fed into https://github.com/Uniswap/merkle-distributor to create the merkle tree for rewards
+Script to calculate reward distribution for the Revert auto-compounder rewards. The output of this script is fed into https://github.com/Uniswap/merkle-distributor to create the merkle tree for claiming rewards
 
-## How rewards are calculated (short version)
+## How rewards are calculated
 
-* For each Uniswap v3 position all compounds which happened during the reward period are fetched
-* **compoundETH** The sum of compounded tokens value is calculated (with token values in ETH at each compound)
-* **feeETH** The amount of fees which were generated while the position was in the auto-compounder during the reward period is calculated (with token values in ETH at each liquidity change event)
-* **vestingFactor** How much of the liquidity which generated fees is vested (see more details below)
-* **vestedCompoundETH** MIN(compoundETH, feeETH) * vestingFactor is calculated
+First we fetch all the compoundingSessions from the Revert Compoundor subgraph[1]. For each session we calculate the following values:
 
-For each account all its positions **vestedCompoundETH** values are summed and divided by the sum of all positions **vestedCompoundETH** to calculate what fraction of the total reward pool it recieves.
+* **Compounded Value**: The summed ETH value of all compounded fees (using prices at each relevant block)
+* **Fee Value**: The summed ETH value of all fees accrued while the position was in the auto-compounder contract during the reward period (using prices at each relevant block)
+
+* **Vesting Factor** Vested fraction for the liquidity in the compounding session which generated the compounded value (see more details below)
+* **Vested Compounded Value** We take the minimum of Compounded Value and Fee Value, so that fees generated prior to the rewards period are not included, and multiply that by the *Vesting Factor*. 
+
+
+**MIN(Compounded Value,  Fee Value) * Vesting Factor.**  
 
 Token prices at specific blocks are taken from the official Uniswap v3 subgraph.
 
 
 ## How time-vesting with changing liquidity works
-Because meanwhile a position is auto-compounding, liquidity can be added and removed, the calculation of vesting is a bit more complicated.
+Liquidity for a position can be increased or decreased while it is auto-compounding, so the calculation of vesting is done as follows:
 
-For each level of liquidity the two values are calculated:
+We take each change in liquidity as a discrete **liquidity level** for which the following values are calculated:
 
 * **vestedLiquidityTime** as liquidity * total time * MIN(1, time in range / vesting period) 
 * **totalLiquidityTime** as liquidity * total time.
@@ -37,4 +40,8 @@ Then:
 ```sh
 npm install
 node index.js
+
 ```
+
+
+[1] For Optimism: [revert-finance/compoundor-optimism](https://thegraph.com/hosted-service/subgraph/revert-finance/uniswap-v3-polygon)
