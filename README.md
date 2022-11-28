@@ -6,8 +6,8 @@ Script to calculate reward distribution for the Revert auto-compounder rewards. 
 
 First we fetch all the compoundingSessions from the Revert Compoundor subgraph[1]. For each session we calculate the following values:
 
-* **Compounded Value**: The summed ETH value of all compounded fees (using prices at each relevant block)
-* **Fee Value**: The summed ETH value of all fees accrued while the position was in the auto-compounder contract during the reward period (using prices at each relevant block)
+* **Compounded Value**: The summed ETH value of all compounded fees (using price of both tokens at the end of incentive period)
+* **Fee Value**: The summed ETH value of all fees accrued while the position was in the auto-compounder contract during the reward period (using price of both tokens at the end of incentive period)
 
 * **Vesting Factor** Vested fraction for the liquidity in the compounding session which generated the compounded value (see more details below)
 * **Vested Compounded Value** We take the minimum of Compounded Value and Fee Value, so that fees generated prior to the rewards period are not included, and multiply that by the *Vesting Factor*. 
@@ -15,7 +15,7 @@ First we fetch all the compoundingSessions from the Revert Compoundor subgraph[1
 
 **MIN(Compounded Value,  Fee Value) * Vesting Factor.**  
 
-Token prices at specific blocks are taken from the official Uniswap v3 subgraph.
+Token prices are taken from the official Uniswap v3 subgraph.
 
 
 ## How time-vesting with changing liquidity works

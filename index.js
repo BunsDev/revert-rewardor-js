@@ -18,6 +18,7 @@ const POOL_RAW = require("./contracts/IUniswapV3Pool.json");
 
 const provider = new ethers.providers.JsonRpcProvider(process.env.RPC_URL)
 
+const compoundorAddress = "0x5411894842e610c4d0f6ed4c232da689400f94a1"
 const factoryAddress = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
 const factory = new ethers.Contract(factoryAddress, FACTORY_RAW.abi, provider)
 const npmAddress = "0xC36442b4a4522E871399CD717aBDD847Ab11FE88"
@@ -134,36 +135,6 @@ async function getTokenPricesAtBlocksPagedCached(token, blocks) {
     return prices
 }
 
-// in the case of sessions with too many compounds - do paging
-async function getCompoundsPaged(sessionId, from, to) {
-    const compounds = []
-    const take = 1000
-    let result
-
-    do {
-        result = await axios.post(compoundorGraphApiUrl, {
-            query: `{
-                compoundSession(id: "${sessionId}") {
-                  compounds(first:${take}, where: { blockNumber_gte: ${from}, blockNumber_lte: ${to}}, orderBy: blockNumber, orderDirection: asc) {
-                    amountAdded0
-                    amountAdded1
-                    blockNumber
-                    token0
-                    token1
-                  }
-                }
-              }`
-        })
-        compounds.push(...result.data.data.compoundSession.compounds)
-
-        if (result.data.data.compoundSession.compounds.length == take) {
-            from = parseInt(result.data.data.compoundSession.compounds[result.data.data.compoundSession.compounds.length - 1].blockNumber, 10) + 1 // paging by block number - assumes there is only one compound per block
-        }
-    } while (result.data.data.compoundSession.compounds.length == take)
-
-    return compounds
-}
-
 async function getCompoundSessionsPaged(from, to) {
     const sessions = []
     const take = 1000
@@ -180,13 +151,6 @@ async function getCompoundSessionsPaged(from, to) {
                   token {
                     id
                   }
-                  compounds(first:1000, where: { blockNumber_gte: ${from}, blockNumber_lte: ${to}}, orderBy: blockNumber, orderDirection: asc) {
-                    amountAdded0
-                    amountAdded1
-                    blockNumber
-                    token0
-                    token1
-                  }
                 }
               }`
         })
@@ -196,9 +160,6 @@ async function getCompoundSessionsPaged(from, to) {
         }
 
         for (const session of result.data.data.compoundSessions) {
-            if(session.compounds.length === 1000) {
-                session.compounds = await getCompoundsPaged(session.id, from, to)
-            }
             // do not add duplicates
             if (!sessions.find(s => s.id == session.id)) {
                 sessions.push(session)
@@ -212,34 +173,10 @@ async function getCompoundSessionsPaged(from, to) {
     return sessions.filter(x => x.endBlockNumber > from || !x.endBlockNumber )
 }
 
-async function averageFeeGrowthPerBlock(position, pool, from, to) {
-
-    const positionKey = ethers.utils.solidityKeccak256([ "address", "int24", "int24" ], [ npmAddress, position.tickLower, position.tickUpper ])
-
-    const fromData = await pool.positions(positionKey, { blockTag: from });
-    const toData = await pool.positions(positionKey, { blockTag: to });
-
-    let fee0 = toData.feeGrowthInside0LastX128.sub(fromData.feeGrowthInside0LastX128)
-    if (fee0.lt(0)) {
-        fee0 = fee0.add(BigNumber.from(2).pow(256))
-    }
-    let fee1 = toData.feeGrowthInside1LastX128.sub(fromData.feeGrowthInside1LastX128)
-    if (fee1.lt(0)) {
-        fee1 = fee1.add(BigNumber.from(2).pow(256))
-    }
-    fee0 = fee0.div(to - from)
-    fee1 = fee1.div(to - from)
-
-    return { fee0, fee1 }
+async function calculateValueAtBlock(amount0, amount1, prices0, prices1, decimals0, decimals1, block) {
+    return prices0[block].times(amount0.toString()).div(BigDecimal(10).pow(decimals0)).plus(prices1[block].times(amount1.toString()).div(BigDecimal(10).pow(decimals1)))
 }
 
-async function calculateFees(from, to, avgFeeGrowth, liquidity, prices0, prices1, decimals0, decimals1) {
-    
-    const fees0 = avgFeeGrowth.fee0.mul(to - from).mul(liquidity).div(BigNumber.from(2).pow(128))
-    const fees1 = avgFeeGrowth.fee1.mul(to - from).mul(liquidity).div(BigNumber.from(2).pow(128))
-    return prices0[to].times(fees0.toString()).div(BigDecimal(10).pow(decimals0)).plus(prices1[to].times(fees1.toString()).div(BigDecimal(10).pow(decimals1)))
-}
-        
 async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, vestingPeriod) {
 
     const addFilter = npm.filters.IncreaseLiquidity(nftId)
@@ -254,86 +191,64 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
         toBlock: to,
         ...withdrawFilter
     })
- 
-    let firstBlock = (adds.length > 0 && (withdraws.length === 0 || adds[0].blockNumber < withdraws[0].blockNumber)) ? adds[0].blockNumber : (withdraws.length > 0 ? withdraws[0].blockNumber : null)
-    const lastBlock = (adds.length > 0 && (withdraws.length === 0 || adds[adds.length - 1].blockNumber > withdraws[withdraws.length - 1].blockNumber)) ? adds[adds.length - 1].blockNumber : (withdraws.length > 0 ? withdraws[withdraws.length - 1].blockNumber : null)
-
-    // if only one data point (compound) - get previous IncreaseLiquidity/DecreaseLiquidity event
-    if (firstBlock == lastBlock) {
-        const previousAdds = await provider.getLogs({
-            fromBlock: 0,
-            toBlock: from,
-            ...addFilter
-        })
-        const previousWithdraws = await provider.getLogs({
-            fromBlock: 0,
-            toBlock: from,
-            ...withdrawFilter
-        })
-
-        firstBlock = (previousAdds.length > 0 && (previousWithdraws.length === 0 || previousAdds[previousAdds.length - 1].blockNumber > previousWithdraws[previousWithdraws.length - 1].blockNumber)) ? previousAdds[previousAdds.length - 1].blockNumber : (previousWithdraws.length > 0 ? previousWithdraws[previousWithdraws.length - 1].blockNumber : null)
-        if (!firstBlock || firstBlock == lastBlock) {
-            throw Error("Could not estimate fee growth.")
-        }
-    }
-
-    const avgFeeGrowth = await averageFeeGrowthPerBlock(position, pool, firstBlock, lastBlock)
-
-    const blocks = [...new Set(adds.map(a => a.blockNumber).concat(withdraws.map(a => a.blockNumber).concat([to])))] // distinct block numbers
-    const prices0 = await getTokenPricesAtBlocksPagedCached(position.token0, blocks)
-    const prices1 = await getTokenPricesAtBlocksPagedCached(position.token1, blocks)
-    const decimals0 = await getTokenDecimalsCached(position.token0)
-    const decimals1 = await getTokenDecimalsCached(position.token1)
+    const collectFilter = npm.filters.Collect(nftId)
+    const collects = await provider.getLogs({
+        fromBlock: from,
+        toBlock: to,
+        ...collectFilter
+    })
 
     let addIndex = 0
     let withdrawIndex = 0
+
     let currentBlock = from
     let currentTimestamp = await getBlockTimestampCached(currentBlock)
     let currentLiquidity = position.liquidity
 
-    let lastSnap = await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: currentBlock })
+    let lastSnap = position.liquidity.gt(0) ? await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: currentBlock }) : null
     
     let liquidityLevels = {}
     liquidityLevels[currentLiquidity] = { secondsInside: 0, totalSeconds: 0 } 
 
-    let fees = BigDecimal(0)
+    const fees = await npm.callStatic.collect([nftId, npmAddress, BigNumber.from(2).pow(128).sub(1), BigNumber.from(2).pow(128).sub(1)], { blockTag: to, from: compoundorAddress })  
+    const initialFees = await npm.callStatic.collect([nftId, npmAddress, BigNumber.from(2).pow(128).sub(1), BigNumber.from(2).pow(128).sub(1)], { blockTag: from, from: compoundorAddress })
+    
+    fees.amount0 = fees.amount0.sub(initialFees.amount0)
+    fees.amount1 = fees.amount1.sub(initialFees.amount1)
+
+    for (const collect of collects) {
+        fees.amount0 = fees.amount0.add(npm.interface.parseLog(collect).args.amount0)
+        fees.amount1 = fees.amount1.add(npm.interface.parseLog(collect).args.amount1)
+    }
 
     while (addIndex < adds.length || withdrawIndex < withdraws.length) {
         const nextAdd = addIndex < adds.length ? adds[addIndex] : null
         const nextWithdraw = withdrawIndex < withdraws.length ? withdraws[withdrawIndex] : null
-
         let f, l;
-        let feeGrowth = avgFeeGrowth
-
         if (nextAdd && (!nextWithdraw || nextAdd.blockNumber <= nextWithdraw.blockNumber)) {
-            if (currentBlock != from) {
-                feeGrowth = await averageFeeGrowthPerBlock(position, pool, currentBlock, nextAdd.blockNumber);
-            }
-
-            f = await calculateFees(currentBlock, nextAdd.blockNumber, feeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
             l = npm.interface.parseLog(nextAdd).args.liquidity
             addIndex++
             currentBlock = nextAdd.blockNumber
         } else {
-            if (currentBlock != from) {
-                feeGrowth = await averageFeeGrowthPerBlock(position, pool, currentBlock, nextWithdraw.blockNumber);
-            }
+            fees.amount0 = fees.amount0.sub(npm.interface.parseLog(nextWithdraw).args.amount0)
+            fees.amount1 = fees.amount1.sub(npm.interface.parseLog(nextWithdraw).args.amount1)
 
-            f = await calculateFees(currentBlock, nextWithdraw.blockNumber, feeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
             l = npm.interface.parseLog(nextWithdraw).args.liquidity.mul(-1) // negate liquidity
             withdrawIndex++
             currentBlock = nextWithdraw.blockNumber
         }
 
-        fees = fees.plus(f)
+        
         const timestamp = await getBlockTimestampCached(currentBlock)
 
         // for special case where liquidity goes from 0 to non0 or vice versa
         const fixedBlockNumber = currentLiquidity.add(l).eq(0) ? currentBlock - 1 : (currentLiquidity.eq(0) ? currentBlock + 1 : currentBlock)
 
         const snap = await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: fixedBlockNumber })
-        liquidityLevels[currentLiquidity].secondsInside += (2 ** 32 + snap.secondsInside - lastSnap.secondsInside) % 2 ** 32
-        liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
+        if (lastSnap) {
+            liquidityLevels[currentLiquidity].secondsInside += (2 ** 32 + snap.secondsInside - lastSnap.secondsInside) % 2 ** 32
+            liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
+        }
         currentTimestamp = timestamp
         lastSnap = snap        
         currentLiquidity = currentLiquidity.add(l)
@@ -341,9 +256,6 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
             liquidityLevels[currentLiquidity] = { secondsInside: 0, totalSeconds: 0 }
         }
     }
-
-    const f = await calculateFees(currentBlock, to, avgFeeGrowth, currentLiquidity, prices0, prices1, decimals0, decimals1)
-    fees = fees.plus(f)
 
     if (currentLiquidity.gt(0)) {
         const timestamp = await getBlockTimestampCached(to)
@@ -371,37 +283,26 @@ async function getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, 
         previousLiquidity = BigNumber.from(liquidity)
     }
 
-    const vestingFactor = BigDecimal(vestedLiquidityTime.toString()).div(BigDecimal(totalLiquidityTime.toString()))
+    const vestingFactor = totalLiquidityTime.gt(0) ? BigDecimal(vestedLiquidityTime.toString()).div(BigDecimal(totalLiquidityTime.toString())) : BigDecimal(0)
+
+    const prices0 = await getTokenPricesAtBlocksPagedCached(position.token0, [to])
+    const prices1 = await getTokenPricesAtBlocksPagedCached(position.token1, [to])
+    const decimals0 = await getTokenDecimalsCached(position.token0)
+    const decimals1 = await getTokenDecimalsCached(position.token1)
+
+    const generatedFees = await calculateValueAtBlock(fees.amount0, fees.amount1, prices0, prices1, decimals0, decimals1, to)
 
     return {
-        generatedFees: fees,
+        generatedFees: generatedFees,
         vestingFactor
     }
-}
-
-async function getAutoCompoundedFees(position, compounds) {
-    let fees = BigDecimal(0)
-    if (compounds.length > 0) {
-        const blocks = compounds.map(c => c.blockNumber)
-        const prices0 = await getTokenPricesAtBlocksPagedCached(position.token0, blocks)
-        const prices1 = await getTokenPricesAtBlocksPagedCached(position.token1, blocks)
-        const decimals0 = await getTokenDecimalsCached(position.token0)
-        const decimals1 = await getTokenDecimalsCached(position.token1)
-
-        for (const compound of compounds) {
-            const amount0 = BigDecimal(compound.amountAdded0).div(BigDecimal(10).pow(decimals0))
-            const amount1 = BigDecimal(compound.amountAdded1).div(BigDecimal(10).pow(decimals1))
-            fees = fees.plus(prices0[compound.blockNumber].times(amount0).plus(prices1[compound.blockNumber].times(amount1)))
-        }
-    } 
-    return fees
 }
 
 async function calculateSessionData(session, startBlock, endBlock, vestingPeriod, retries = 0) {
 
     try {
         const from = parseInt(session.startBlockNumber, 10) < startBlock ? startBlock : parseInt(session.startBlockNumber, 10)
-        const to = parseInt(session.endBlockNumber || (endBlock + ""), 10) >= endBlock ? endBlock : parseInt(session.endBlockNumber, 10)
+        const to = parseInt(session.endBlockNumber || ((endBlock + 1) + ""), 10) > endBlock ? endBlock : (parseInt(session.endBlockNumber, 10) - 1) // one block before removing from autocompounder - because of owner change
         const nftId = parseInt(session.token.id, 10)
         const position = await npm.positions(nftId, { blockTag: from });
     
@@ -417,32 +318,26 @@ async function calculateSessionData(session, startBlock, endBlock, vestingPeriod
         if (includeListTokens.length > 0 && !includeListTokens.find(t => symbol0 == t || symbol1 == t)) {
             return BigDecimal(0)
         }
-
-        // get all compounded fees during reward period
-        const compounds = session.compounds
         
         let amount = BigDecimal(0)
 
-        if (compounds.length > 0) {
-             // get compounded and generated fees
-            const compoundedFees = await getAutoCompoundedFees(position, compounds)
-    
-            const poolAddress = await factory.getPool(position.token0, position.token1, position.fee, { blockTag: from })
-            const pool = new ethers.Contract(poolAddress, POOL_RAW.abi, provider)
-    
-            const data = await getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, vestingPeriod)
+        const poolAddress = await factory.getPool(position.token0, position.token1, position.fee, { blockTag: from })
+        const pool = new ethers.Contract(poolAddress, POOL_RAW.abi, provider)
 
-            // to be sure
-            if (data.generatedFees.lt(0) || compoundedFees.lt(0)) {
-                throw Error("Invalid fees for token: ", session.token.id)
-            }
+        const data = await getGeneratedFeeAndVestingFactor(nftId, position, pool, from, to, vestingPeriod)
 
-            amount = data.generatedFees && compoundedFees.gt(data.generatedFees) ? data.generatedFees : compoundedFees
-            amount = amount.times(data.vestingFactor) // apply vesting period
-
-            console.log(nftId, compounds.length, amount.toString())
+        // can happen in rare cases when price in unfavorable for fees
+        if (data.generatedFees.lt(0)) {
+            throw Error("Invalid fees for token: ", session.token.id, data.generatedFees.toString())
         }
-    
+
+        //amount = data.generatedFees && compoundedFees.gt(data.generatedFees) ? data.generatedFees : compoundedFees
+        amount = data.generatedFees
+        
+        amount = amount.times(data.vestingFactor) // apply vesting period
+
+        console.log(nftId, amount.toString())
+
         return { amount, symbol0, symbol1, position }
     } catch (err) {
         // retry handling for rare temporary errors from alchemy rpc endpoint
