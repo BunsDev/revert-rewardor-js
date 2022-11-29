@@ -36,6 +36,11 @@ const timestampCache = {}
 const includeListTokens = process.env.INCLUDE_LIST_TOKENS.split(",").filter(i => i)
 const includeListTokenPairs = process.env.INCLUDE_LIST_TOKEN_PAIRS.split(",").filter(i => i).map(p => ({ symbolA: p.split("/")[0], symbolB: p.split("/")[1] }))
 const excludeListTokens = process.env.EXCLUDE_LIST_TOKENS.split(",").filter(i => i)
+const excludeListAccounts = process.env.EXCLUDE_LIST_ACCOUNTS.split(",").filter(i => i)
+
+// add some fixed token prices because they are missing in the subgraph (small liquidity coins)
+const fixedTokenPrices = {}
+process.env.FIXED_TOKEN_PRICES.split(",").filter(i => i).forEach(p => fixedTokenPrices[p.split(":")[0].toLowerCase()] = BigDecimal(p.split(":")[1]))
 
 // execute main function with configured env variables
 run(parseInt(process.env.START_BLOCK), parseInt(process.env.END_BLOCK), parseInt(process.env.VESTING_PERIOD))
@@ -52,16 +57,19 @@ async function run(startBlock, endBlock, vestingPeriod) {
 
     // create table of all valid compounded amounts per account / per position
     for (const session of sessions) {
+       
         const data = await calculateSessionData(session, startBlock, endBlock, vestingPeriod)
-        if (!accounts[session.account]) {
-            accounts[session.account] = data.amount
-        } else {
-            accounts[session.account] = accounts[session.account].plus(data.amount)
-        }
-        if (!positions[session.token.id]) {
-            positions[session.token.id] = { id: session.token.id, symbol0: data.symbol0, symbol1: data.symbol1, amount: data.amount, fee: data.position.fee }
-        } else {
-            positions[session.token.id].amount = positions[session.token.id].amount.plus(data.amount)
+        if (data) {     
+            if (!accounts[session.account]) {
+                accounts[session.account] = data.amount
+            } else {
+                accounts[session.account] = accounts[session.account].plus(data.amount)
+            }
+            if (!positions[session.token.id]) {
+                positions[session.token.id] = { id: session.token.id, symbol0: data.symbol0, symbol1: data.symbol1, amount: data.amount, fee: data.position.fee }
+            } else {
+                positions[session.token.id].amount = positions[session.token.id].amount.plus(data.amount)
+            }
         }
     }
 
@@ -82,6 +90,24 @@ async function run(startBlock, endBlock, vestingPeriod) {
     const content = {}
     finalRewards.forEach(r => content[r.account] = r.reward.toString())
     fs.writeFileSync(process.env.FILE_NAME, JSON.stringify(content))
+}
+
+async function findEmptySubgraphPrices(startBlock, endBlock) {
+    const sessions = await getCompoundSessionsPaged(startBlock, endBlock)
+    const tokens = new Set()
+    for (const session of sessions) {
+        const from = parseInt(session.startBlockNumber, 10) < startBlock ? startBlock : parseInt(session.startBlockNumber, 10)
+        const position = await npm.positions(session.token.id, { blockTag: from })
+        const prices0 = await getTokenPricesAtBlocksPagedCached(position.token0, [endBlock])
+        const prices1 = await getTokenPricesAtBlocksPagedCached(position.token1, [endBlock])
+        if (prices0[endBlock].eq(0)) {
+            tokens.add(position.token0)
+        }
+        if (prices1[endBlock].eq(0)) {
+            tokens.add(position.token1)
+        }
+    }
+    console.log(tokens)
 }
 
 async function getBlockTimestampCached(block) {
@@ -110,6 +136,12 @@ async function getTokenSymbolCached(token) {
 async function getTokenPricesAtBlocksPagedCached(token, blocks) {
 
     token = token.toLowerCase()
+
+    if (fixedTokenPrices[token]) {
+        const prices = {}
+        blocks.forEach(b => prices[b] = fixedTokenPrices[token])
+        return prices
+    }
 
     if (!priceCache[token]) {
         priceCache[token] = {}
@@ -171,11 +203,24 @@ async function getCompoundSessionsPaged(from, to) {
     return sessions.filter(x => x.endBlockNumber > from || !x.endBlockNumber)
 }
 
-async function calculateValueAtBlock(amount0, amount1, prices0, prices1, decimals0, decimals1, block) {
+async function calculateValueAtBlock(amount0, amount1, token0, token1, block) {
+
+    const prices0 = await getTokenPricesAtBlocksPagedCached(token0, [block])
+    const prices1 = await getTokenPricesAtBlocksPagedCached(token1, [block])
+    const decimals0 = await getTokenDecimalsCached(token0)
+    const decimals1 = await getTokenDecimalsCached(token1)
+
+    if (prices0[block].eq(0)) {
+        console.log("Price ZERO", token0)
+    }
+    if (prices1[block].eq(0)) {
+        console.log("Price ZERO", token1)
+    }
+
     return prices0[block].times(amount0.toString()).div(BigDecimal(10).pow(decimals0)).plus(prices1[block].times(amount1.toString()).div(BigDecimal(10).pow(decimals1)))
 }
 
-async function getGeneratedVestedFees(nftId, position, pool, from, to, vestingPeriod) {
+async function getGeneratedVestedFees(nftId, position, pool, from, to, endBlock, vestingPeriod) {
 
     const addFilter = npm.filters.IncreaseLiquidity(nftId)
     const adds = await provider.getLogs({
@@ -240,7 +285,7 @@ async function getGeneratedVestedFees(nftId, position, pool, from, to, vestingPe
         const timestamp = await getBlockTimestampCached(currentBlock)
 
         // for special case where liquidity goes from 0 to non0 or vice versa
-        const fixedBlockNumber = currentLiquidity.add(l).eq(0) ? currentBlock - 1 : (currentLiquidity.eq(0) ? currentBlock + 1 : currentBlock)
+        const fixedBlockNumber = currentLiquidity.add(liquidity).eq(0) ? currentBlock - 1 : (currentLiquidity.eq(0) ? currentBlock + 1 : currentBlock)
 
         const snap = await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: fixedBlockNumber })
         if (lastSnap) {
@@ -282,14 +327,7 @@ async function getGeneratedVestedFees(nftId, position, pool, from, to, vestingPe
     }
 
     const vestingFactor = totalLiquidityTime.gt(0) ? BigDecimal(vestedLiquidityTime.toString()).div(BigDecimal(totalLiquidityTime.toString())) : BigDecimal(0)
-
-    const prices0 = await getTokenPricesAtBlocksPagedCached(position.token0, [to])
-    const prices1 = await getTokenPricesAtBlocksPagedCached(position.token1, [to])
-    const decimals0 = await getTokenDecimalsCached(position.token0)
-    const decimals1 = await getTokenDecimalsCached(position.token1)
-
-    const generatedFees = await calculateValueAtBlock(fees.amount0, fees.amount1, prices0, prices1, decimals0, decimals1, to)
-
+    const generatedFees = await calculateValueAtBlock(fees.amount0, fees.amount1, position.token0, position.token1, endBlock)
     return generatedFees.times(vestingFactor)
 }
 
@@ -305,19 +343,22 @@ async function calculateSessionData(session, startBlock, endBlock, vestingPeriod
         const symbol1 = await getTokenSymbolCached(position.token1)
 
         if (excludeListTokens.find(t => symbol0 == t || symbol1 == t)) {
-            return BigDecimal(0)
+            return null
         }
         if (includeListTokenPairs.length > 0 && !includeListTokenPairs.find(t => symbol0 == t.symbolA && symbol1 == t.symbolB || symbol1 == t.symbolA && symbol0 == t.symbolB)) {
-            return BigDecimal(0)
+            return null
         }
         if (includeListTokens.length > 0 && !includeListTokens.find(t => symbol0 == t || symbol1 == t)) {
-            return BigDecimal(0)
+            return null
+        }
+        if (excludeListAccounts.find(a => a.toLowerCase() === session.account.toLowerCase())) {
+            return null
         }
 
         const poolAddress = await factory.getPool(position.token0, position.token1, position.fee, { blockTag: from })
         const pool = new ethers.Contract(poolAddress, POOL_RAW.abi, provider)
 
-        const amount = await getGeneratedVestedFees(nftId, position, pool, from, to, vestingPeriod)
+        const amount = await getGeneratedVestedFees(nftId, position, pool, from, to, endBlock, vestingPeriod)
 
         // this should never happen - if it does needs fix
         if (amount.lt(0)) {
