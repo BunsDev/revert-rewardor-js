@@ -50,26 +50,39 @@ async function run(startBlock, endBlock, vestingPeriod) {
 
     const sessions = await getCompoundSessionsPaged(startBlock, endBlock)
 
-    const positions = {}
-    const accounts = {}
+    // read from file if temp progress
+    const positions = fs.existsSync(process.env.TEMP_FILE_NAME) ? JSON.parse(fs.readFileSync(process.env.TEMP_FILE_NAME)) : {}
+    // convert to bigdecimals
+    Object.values(positions).forEach(p => p.amount = BigDecimal(p.amount))
 
     console.log("Processing", sessions.length, "Sessions")
 
     // create table of all valid compounded amounts per account / per position
-    for (const session of sessions) {
-       
+    for (const session of sessions) { //.filter(x => x.token.id == 586378 || x.token.id == 567844 || x.token.id == 572769 || x.token.id == 571800)
+        const sessionStartBlock = parseInt(session.startBlockNumber, 10)
+
+        // skip already calculated
+        if (positions[session.token.id] && sessionStartBlock >= positions[session.token.id].lastStartBlockNumber) {
+            continue;
+        }
+
         const data = await calculateSessionData(session, startBlock, endBlock, vestingPeriod)
-        if (data) {     
-            if (!accounts[session.account]) {
-                accounts[session.account] = data.amount
-            } else {
-                accounts[session.account] = accounts[session.account].plus(data.amount)
-            }
-            if (!positions[session.token.id]) {
-                positions[session.token.id] = { id: session.token.id, symbol0: data.symbol0, symbol1: data.symbol1, amount: data.amount, fee: data.position.fee }
-            } else {
-                positions[session.token.id].amount = positions[session.token.id].amount.plus(data.amount)
-            }
+        if (!positions[session.token.id]) {
+            positions[session.token.id] = { id: session.token.id, account: session.account, lastStartBlockNumber: sessionStartBlock, symbol0: data.symbol0, symbol1: data.symbol1, amount: data.amount, fee: data.position.fee }
+        } else {
+            positions[session.token.id].amount = positions[session.token.id].amount.plus(data.amount)
+            positions[session.token.id].lastStartBlockNumber = sessionStartBlock
+        }
+
+        fs.writeFileSync(process.env.TEMP_FILE_NAME, JSON.stringify(positions))
+    }
+
+    const accounts = {}
+    for (const position of Object.values(positions)) {
+        if (!accounts[position.account]) {
+            accounts[position.account] = position.amount
+        } else {
+            accounts[position.account] = accounts[position.account].plus(position.amount)
         }
     }
 
@@ -90,6 +103,8 @@ async function run(startBlock, endBlock, vestingPeriod) {
     const content = {}
     finalRewards.forEach(r => content[r.account] = r.reward.toString())
     fs.writeFileSync(process.env.FILE_NAME, JSON.stringify(content))
+
+    fs.rmSync(process.env.TEMP_FILE_NAME)
 }
 
 async function findEmptySubgraphPrices(startBlock, endBlock) {
@@ -327,6 +342,7 @@ async function getGeneratedVestedFees(nftId, position, pool, from, to, endBlock,
     }
 
     const vestingFactor = totalLiquidityTime.gt(0) ? BigDecimal(vestedLiquidityTime.toString()).div(BigDecimal(totalLiquidityTime.toString())) : BigDecimal(0)
+
     const generatedFees = await calculateValueAtBlock(fees.amount0, fees.amount1, position.token0, position.token1, endBlock)
     return generatedFees.times(vestingFactor)
 }
@@ -343,16 +359,16 @@ async function calculateSessionData(session, startBlock, endBlock, vestingPeriod
         const symbol1 = await getTokenSymbolCached(position.token1)
 
         if (excludeListTokens.find(t => symbol0 == t || symbol1 == t)) {
-            return null
+            return { amount: BigDecimal(0), symbol0, symbol1, position }
         }
         if (includeListTokenPairs.length > 0 && !includeListTokenPairs.find(t => symbol0 == t.symbolA && symbol1 == t.symbolB || symbol1 == t.symbolA && symbol0 == t.symbolB)) {
-            return null
+            return { amount: BigDecimal(0), symbol0, symbol1, position }
         }
         if (includeListTokens.length > 0 && !includeListTokens.find(t => symbol0 == t || symbol1 == t)) {
-            return null
+            return { amount: BigDecimal(0), symbol0, symbol1, position }
         }
         if (excludeListAccounts.find(a => a.toLowerCase() === session.account.toLowerCase())) {
-            return null
+            return { amount: BigDecimal(0), symbol0, symbol1, position }
         }
 
         const poolAddress = await factory.getPool(position.token0, position.token1, position.fee, { blockTag: from })
