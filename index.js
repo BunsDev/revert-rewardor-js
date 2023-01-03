@@ -58,7 +58,7 @@ async function run(startBlock, endBlock, vestingPeriod) {
     console.log("Processing", sessions.length, "Sessions")
 
     // create table of all valid compounded amounts per account / per position
-    for (const session of sessions) { //.filter(x => x.token.id == 586378 || x.token.id == 567844 || x.token.id == 572769 || x.token.id == 571800)
+    for (const session of sessions) {
         const sessionStartBlock = parseInt(session.startBlockNumber, 10)
 
         // skip already calculated
