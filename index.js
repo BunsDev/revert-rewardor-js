@@ -62,7 +62,7 @@ async function run(startBlock, endBlock, vestingPeriod) {
         const sessionStartBlock = parseInt(session.startBlockNumber, 10)
 
         // skip already calculated
-        if (positions[session.token.id] && sessionStartBlock >= positions[session.token.id].lastStartBlockNumber) {
+        if (positions[session.token.id] && sessionStartBlock <= positions[session.token.id].lastStartBlockNumber) {
             continue;
         }
 
