@@ -88,6 +88,8 @@ async function run(startBlock, endBlock, vestingPeriod) {
 
     // calculate proportional amounts of reward
     const totalReward = BigDecimal(process.env.TOTAL_REWARD)
+    const totalRewardDigits = 18
+    
     const total = Object.values(accounts).reduce((a, c) => a.plus(c), BigDecimal(0))
     const finalRewards = Object.entries(accounts).map(([account, amount]) => (
         {
@@ -96,7 +98,7 @@ async function run(startBlock, endBlock, vestingPeriod) {
         })).filter(x => x.reward.gt(0))
 
     // save table to file for position analysis
-    const infoContent = Object.values(positions).map(p => p.id + "," + p.symbol0 + "," + p.symbol1 + "," + p.fee + "," + p.amount.toString()).join("\n")
+    const infoContent = Object.values(positions).sort((a, b) => a.amount.gt(b.amount) ? -1 : a.amount.lt(b.amount) ? 1 : 0).map(p => p.id + "," + p.symbol0 + "," + p.symbol1 + "," + p.fee + "," + p.account + "," + p.amount.toString() + "," + p.amount.div(total).mul(totalReward).div(BigDecimal(10).pow(totalRewardDigits)).toString()).join("\n")
     fs.writeFileSync(process.env.INFO_FILE_NAME, infoContent)
 
     // save json to file for merkle tree construction
@@ -104,7 +106,25 @@ async function run(startBlock, endBlock, vestingPeriod) {
     finalRewards.forEach(r => content[r.account] = r.reward.toString())
     fs.writeFileSync(process.env.FILE_NAME, JSON.stringify(content))
 
-    fs.rmSync(process.env.TEMP_FILE_NAME)
+    //fs.rmSync(process.env.TEMP_FILE_NAME)
+}
+
+function retry(fn, ms = 10000, maxRetries = 5) {
+    return new Promise((resolve, reject) => {
+        var retries = 0;
+        fn()
+            .then(resolve)
+            .catch(() => {
+                setTimeout(() => {
+                    console.log('retrying failed promise...');
+                    ++retries;
+                    if (retries == maxRetries) {
+                        return reject('maximum retries exceeded');
+                    }
+                    retry(fn, ms).then(resolve);
+                }, ms);
+            })
+    })
 }
 
 async function findEmptySubgraphPrices(startBlock, endBlock) {
@@ -127,7 +147,7 @@ async function findEmptySubgraphPrices(startBlock, endBlock) {
 
 async function getBlockTimestampCached(block) {
     if (!timestampCache[block]) {
-        timestampCache[block] = (await provider.getBlock(block)).timestamp
+        timestampCache[block] = (await retry(async () => await provider.getBlock(block))).timestamp
     }
     return timestampCache[block]
 }
@@ -302,7 +322,7 @@ async function getGeneratedVestedFees(nftId, position, pool, from, to, endBlock,
         // for special case where liquidity goes from 0 to non0 or vice versa
         const fixedBlockNumber = currentLiquidity.add(liquidity).eq(0) ? currentBlock - 1 : (currentLiquidity.eq(0) ? currentBlock + 1 : currentBlock)
 
-        const snap = await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: fixedBlockNumber })
+        const snap = await retry(async () => await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: fixedBlockNumber }))
         if (lastSnap) {
             liquidityLevels[currentLiquidity].secondsInside += (2 ** 32 + snap.secondsInside - lastSnap.secondsInside) % 2 ** 32
             liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
