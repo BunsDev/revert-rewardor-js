@@ -72,6 +72,9 @@ async function run(startBlock, endBlock, vestingPeriod) {
         } else {
             positions[session.token.id].amount = positions[session.token.id].amount.plus(data.amount)
             positions[session.token.id].lastStartBlockNumber = sessionStartBlock
+
+            // if in a newer session, account is changed (NFT was transfered) - the latest account should have all the positions rewards from this reward period (business decision)
+            positions[session.token.id].account = session.account
         }
 
         fs.writeFileSync(process.env.TEMP_FILE_NAME, JSON.stringify(positions))
