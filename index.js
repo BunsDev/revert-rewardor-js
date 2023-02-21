@@ -16,7 +16,7 @@ const NPM_RAW = require("./contracts/INonfungiblePositionManager.json")
 const FACTORY_RAW = require("./contracts/IUniswapV3Factory.json")
 const POOL_RAW = require("./contracts/IUniswapV3Pool.json")
 
-const provider = new ethers.providers.JsonRpcProvider(process.env.RPC_URL)
+const provider = new ethers.providers.JsonRpcBatchProvider(process.env.RPC_URL)
 
 const factoryAddress = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
 const factory = new ethers.Contract(factoryAddress, FACTORY_RAW.abi, provider)
@@ -59,7 +59,7 @@ async function run(startBlock, endBlock, vestingPeriod) {
     // convert to bigdecimals
     Object.values(positions).forEach(p => p.amount = BigDecimal(p.amount))
 
-    console.log("Processing", allSessions.length, "Sessions")
+    console.log("Processing", Object.keys(sessionsGrouped).length - Object.keys(positions).length, "positions")
 
     // create table of all valid compounded amounts per account / per position
     for (const tokenId in sessionsGrouped) {
@@ -108,27 +108,9 @@ async function run(startBlock, endBlock, vestingPeriod) {
     //fs.rmSync(process.env.TEMP_FILE_NAME)
 }
 
-function retry(fn, ms = 10000, maxRetries = 5) {
-    return new Promise((resolve, reject) => {
-        var retries = 0;
-        fn()
-            .then(resolve)
-            .catch(() => {
-                setTimeout(() => {
-                    console.log('retrying failed promise...');
-                    ++retries;
-                    if (retries == maxRetries) {
-                        return reject('maximum retries exceeded');
-                    }
-                    retry(fn, ms).then(resolve);
-                }, ms);
-            })
-    })
-}
-
 async function getBlockTimestampCached(block) {
     if (!timestampCache[block]) {
-        timestampCache[block] = (await retry(async () => await provider.getBlock(block))).timestamp
+        timestampCache[block] = (await provider.getBlock(block)).timestamp
     }
     return timestampCache[block]
 }
@@ -239,41 +221,88 @@ async function calculateValueAtBlock(amount0, amount1, token0, token1, block) {
 async function calculateLiquidityLevelsAndFees(nftId, position, pool, from, to) {
 
     const addFilter = npm.filters.IncreaseLiquidity(nftId)
-    const adds = await provider.getLogs({
-        fromBlock: from,
-        toBlock: to,
-        ...addFilter
-    })
     const withdrawFilter = npm.filters.DecreaseLiquidity(nftId)
-    const withdraws = await provider.getLogs({
-        fromBlock: from,
-        toBlock: to,
-        ...withdrawFilter
-    })
     const collectFilter = npm.filters.Collect(nftId)
-    const collects = await provider.getLogs({
-        fromBlock: from,
-        toBlock: to,
-        ...collectFilter
-    })
+
+    const promises = []
+    promises.push(provider.getLogs({ fromBlock: from, toBlock: to, ...addFilter}))
+    promises.push(provider.getLogs({ fromBlock: from, toBlock: to, ...withdrawFilter}))
+    promises.push(provider.getLogs({ fromBlock: from, toBlock: to, ...collectFilter}))
+    const results = await Promise.all(promises)
+
+    const adds = results[0] 
+    const withdraws = results[1] 
+    const collects = results[2] 
+
+    console.log(adds.length, withdraws.length, collects.length)
+
 
     let addIndex = 0
     let withdrawIndex = 0
-
-    let currentBlock = from
-    let currentTimestamp = await getBlockTimestampCached(currentBlock)
     let currentLiquidity = position.liquidity
+    let currentBlock = from
 
-    let lastSnap = position.liquidity.gt(0) ? await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: currentBlock }) : null
+    // collect all blocknumbers needed
+    const blockNumbers = [from]
+    while (addIndex < adds.length || withdrawIndex < withdraws.length) {
+        const nextAdd = addIndex < adds.length ? adds[addIndex] : null
+        const nextWithdraw = withdrawIndex < withdraws.length ? withdraws[withdrawIndex] : null
+        let liquidity
+        if (nextAdd && (!nextWithdraw || nextAdd.blockNumber <= nextWithdraw.blockNumber)) {
+            liquidity = npm.interface.parseLog(nextAdd).args.liquidity
+            addIndex++
+            currentBlock = nextAdd.blockNumber
+        } else {
+            liquidity = npm.interface.parseLog(nextWithdraw).args.liquidity.mul(-1) // negate liquidity
+            withdrawIndex++
+            currentBlock = nextWithdraw.blockNumber
+        }
+
+        // for special case where liquidity goes from 0 to non0 or vice versa
+        const fixedBlockNumber = currentLiquidity.add(liquidity).eq(0) ? currentBlock - 1 : (currentLiquidity.eq(0) ? currentBlock + 1 : currentBlock)
+        blockNumbers.push(fixedBlockNumber)
+        currentLiquidity = currentLiquidity.add(liquidity)
+    }
+    blockNumbers.push(to)
+
+    // load data batched in the order needed
+    let snapshotIndex = 0
+    let timestampIndex = 0
+    const snapshotCumulativesInsides = await Promise.all(blockNumbers.map(async bn => { 
+        try { 
+            return await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: bn } )
+        } catch (err) { 
+            console.log(err)
+            return null 
+        }
+    }))
+    const timestamps = await Promise.all(blockNumbers.map(getBlockTimestampCached))
+
+
+    // calculate liquidities
+    addIndex = 0
+    withdrawIndex = 0
+    currentLiquidity = position.liquidity
+    currentBlock = from
+
+    let lastSnap = snapshotCumulativesInsides[snapshotIndex++]
+    let currentTimestamp = timestamps[timestampIndex++]
 
     let liquidityLevels = {}
     liquidityLevels[currentLiquidity] = { secondsInside: 0, totalSeconds: 0 }
 
-    const fees = {}
-    const initialFees = await npm.callStatic.collect([nftId, npmAddress, BigNumber.from(2).pow(128).sub(1), BigNumber.from(2).pow(128).sub(1)], { blockTag: from, from: compoundorAddress })
-    const finalFees = await npm.callStatic.collect([nftId, npmAddress, BigNumber.from(2).pow(128).sub(1), BigNumber.from(2).pow(128).sub(1)], { blockTag: to, from: compoundorAddress })
-    fees.amount0 = finalFees.amount0.sub(initialFees.amount0)
-    fees.amount1 = finalFees.amount1.sub(initialFees.amount1)
+    const feePromises = [
+        npm.callStatic.collect([nftId, npmAddress, BigNumber.from(2).pow(128).sub(1), BigNumber.from(2).pow(128).sub(1)], { blockTag: from, from: compoundorAddress }),
+        npm.callStatic.collect([nftId, npmAddress, BigNumber.from(2).pow(128).sub(1), BigNumber.from(2).pow(128).sub(1)], { blockTag: to, from: compoundorAddress })
+    ]
+    const feeResults = await Promise.all(feePromises)
+    const initialFees = feeResults[0] 
+    const finalFees = feeResults[1]
+
+    const fees = {
+        amount0: finalFees.amount0.sub(initialFees.amount0),
+        amount1: finalFees.amount1.sub(initialFees.amount1)
+    }
 
     for (const collect of collects) {
         fees.amount0 = fees.amount0.add(npm.interface.parseLog(collect).args.amount0)
@@ -298,12 +327,8 @@ async function calculateLiquidityLevelsAndFees(nftId, position, pool, from, to) 
             currentBlock = nextWithdraw.blockNumber
         }
 
-        const timestamp = await getBlockTimestampCached(currentBlock)
-
-        // for special case where liquidity goes from 0 to non0 or vice versa
-        const fixedBlockNumber = currentLiquidity.add(liquidity).eq(0) ? currentBlock - 1 : (currentLiquidity.eq(0) ? currentBlock + 1 : currentBlock)
-
-        const snap = await retry(async () => await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: fixedBlockNumber }))
+        const timestamp = timestamps[timestampIndex++]
+        const snap = snapshotCumulativesInsides[snapshotIndex++]
         if (lastSnap) {
             liquidityLevels[currentLiquidity].secondsInside += (2 ** 32 + snap.secondsInside - lastSnap.secondsInside) % 2 ** 32
             liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
@@ -317,8 +342,8 @@ async function calculateLiquidityLevelsAndFees(nftId, position, pool, from, to) 
     }
 
     if (currentLiquidity.gt(0)) {
-        const timestamp = await getBlockTimestampCached(to)
-        const snap = await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: to })
+        const timestamp = timestamps[timestampIndex++]
+        const snap = snapshotCumulativesInsides[snapshotIndex++]
         liquidityLevels[currentLiquidity].secondsInside += (2 ** 32 + snap.secondsInside - lastSnap.secondsInside) % 2 ** 32
         liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
     }
@@ -328,7 +353,13 @@ async function calculateLiquidityLevelsAndFees(nftId, position, pool, from, to) 
 
 async function calculatePositionData(sessions, startBlock, endBlock, vestingPeriod) {
 
-    const position = await npm.positions(sessions[0].token.id, { blockTag: parseInt(sessions[0].startBlockNumber, 10) })
+    let firstBlock = parseInt(sessions[0].startBlockNumber, 10)
+    if (firstBlock < startBlock) {
+        firstBlock = startBlock
+    }
+
+    // position at beginning of first session
+    const position = await npm.positions(sessions[0].token.id, { blockTag: firstBlock })
 
     const symbol0 = await getTokenSymbolCached(position.token0)
     const symbol1 = await getTokenSymbolCached(position.token1)
@@ -348,7 +379,7 @@ async function calculatePositionData(sessions, startBlock, endBlock, vestingPeri
 
     // merge liquidity levels and fees of all sessions
     for (const session of sessions) {
-        const res = await calculateSessionLiquidityLevelsAndFees(position, session, startBlock, endBlock, vestingPeriod)
+        const res = await calculateSessionLiquidityLevelsAndFees(session == sessions[0] ? position : null, session, startBlock, endBlock)
         for (const l in res.liquidityLevels) {
             if (liquidityLevels[l]) {
                 liquidityLevels[l].secondsInside += res.liquidityLevels[l].secondsInside
@@ -397,6 +428,10 @@ async function calculateSessionLiquidityLevelsAndFees(position, session, startBl
         const from = parseInt(session.startBlockNumber, 10) < startBlock ? startBlock : parseInt(session.startBlockNumber, 10)
         const to = parseInt(session.endBlockNumber || ((endBlock + 1) + ""), 10) > endBlock ? endBlock : (parseInt(session.endBlockNumber, 10) - 1) // one block before removing from autocompounder - because of owner change
         const nftId = parseInt(session.token.id, 10)
+
+        if (!position) {
+            position = await npm.positions(session.token.id, { blockTag: from })
+        }
 
         const poolAddress = await factory.getPool(position.token0, position.token1, position.fee, { blockTag: from })
         const pool = new ethers.Contract(poolAddress, POOL_RAW.abi, provider)
