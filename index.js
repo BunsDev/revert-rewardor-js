@@ -36,7 +36,6 @@ const timestampCache = {}
 const includeListTokens = process.env.INCLUDE_LIST_TOKENS.split(",").filter(i => i)
 const includeListTokenPairs = process.env.INCLUDE_LIST_TOKEN_PAIRS.split(",").filter(i => i).map(p => ({ symbolA: p.split("/")[0], symbolB: p.split("/")[1] }))
 const excludeListTokens = process.env.EXCLUDE_LIST_TOKENS.split(",").filter(i => i)
-const excludeListAccounts = process.env.EXCLUDE_LIST_ACCOUNTS.split(",").filter(i => i)
 
 // add some fixed token prices because they are missing in the subgraph (small liquidity coins)
 const fixedTokenPrices = {}
@@ -48,34 +47,31 @@ run(parseInt(process.env.START_BLOCK), parseInt(process.env.END_BLOCK), parseInt
 // main function which calculates reward distribution
 async function run(startBlock, endBlock, vestingPeriod) {
 
-    const sessions = await getCompoundSessionsPaged(startBlock, endBlock)
+    const allSessions = await getCompoundSessionsPaged(startBlock, endBlock)
+    const sessionsGrouped = allSessions.reduce((group, session) => {
+        group[session.token.id] = group[session.token.id] ?? []
+        group[session.token.id].push(session)
+        return group
+      }, {})
 
     // read from file if temp progress
     const positions = fs.existsSync(process.env.TEMP_FILE_NAME) ? JSON.parse(fs.readFileSync(process.env.TEMP_FILE_NAME)) : {}
     // convert to bigdecimals
     Object.values(positions).forEach(p => p.amount = BigDecimal(p.amount))
 
-    console.log("Processing", sessions.length, "Sessions")
+    console.log("Processing", allSessions.length, "Sessions")
 
     // create table of all valid compounded amounts per account / per position
-    for (const session of sessions) {
-        const sessionStartBlock = parseInt(session.startBlockNumber, 10)
+    for (const tokenId in sessionsGrouped) {
+        const sessions = sessionsGrouped[tokenId]
 
         // skip already calculated
-        if (positions[session.token.id] && sessionStartBlock <= positions[session.token.id].lastStartBlockNumber) {
+        if (positions[tokenId]) {
             continue;
         }
 
-        const data = await calculateSessionData(session, startBlock, endBlock, vestingPeriod)
-        if (!positions[session.token.id]) {
-            positions[session.token.id] = { id: session.token.id, account: session.account, lastStartBlockNumber: sessionStartBlock, symbol0: data.symbol0, symbol1: data.symbol1, amount: data.amount, fee: data.position.fee }
-        } else {
-            positions[session.token.id].amount = positions[session.token.id].amount.plus(data.amount)
-            positions[session.token.id].lastStartBlockNumber = sessionStartBlock
-
-            // if in a newer session, account is changed (NFT was transfered) - the latest account should have all the positions rewards from this reward period (business decision)
-            positions[session.token.id].account = session.account
-        }
+        const data = await calculatePositionData(sessions, startBlock, endBlock, vestingPeriod)
+        positions[tokenId] = { id: tokenId, account: sessions[sessions.length - 1].account, symbol0: data.symbol0, symbol1: data.symbol1, amount: data.amount, fee: data.position.fee }
 
         fs.writeFileSync(process.env.TEMP_FILE_NAME, JSON.stringify(positions))
     }
@@ -128,24 +124,6 @@ function retry(fn, ms = 10000, maxRetries = 5) {
                 }, ms);
             })
     })
-}
-
-async function findEmptySubgraphPrices(startBlock, endBlock) {
-    const sessions = await getCompoundSessionsPaged(startBlock, endBlock)
-    const tokens = new Set()
-    for (const session of sessions) {
-        const from = parseInt(session.startBlockNumber, 10) < startBlock ? startBlock : parseInt(session.startBlockNumber, 10)
-        const position = await npm.positions(session.token.id, { blockTag: from })
-        const prices0 = await getTokenPricesAtBlocksPagedCached(position.token0, [endBlock])
-        const prices1 = await getTokenPricesAtBlocksPagedCached(position.token1, [endBlock])
-        if (prices0[endBlock].eq(0)) {
-            tokens.add(position.token0)
-        }
-        if (prices1[endBlock].eq(0)) {
-            tokens.add(position.token1)
-        }
-    }
-    console.log(tokens)
 }
 
 async function getBlockTimestampCached(block) {
@@ -258,7 +236,7 @@ async function calculateValueAtBlock(amount0, amount1, token0, token1, block) {
     return prices0[block].times(amount0.toString()).div(BigDecimal(10).pow(decimals0)).plus(prices1[block].times(amount1.toString()).div(BigDecimal(10).pow(decimals1)))
 }
 
-async function getGeneratedVestedFees(nftId, position, pool, from, to, endBlock, vestingPeriod) {
+async function calculateLiquidityLevelsAndFees(nftId, position, pool, from, to) {
 
     const addFilter = npm.filters.IncreaseLiquidity(nftId)
     const adds = await provider.getLogs({
@@ -345,6 +323,44 @@ async function getGeneratedVestedFees(nftId, position, pool, from, to, endBlock,
         liquidityLevels[currentLiquidity].totalSeconds += timestamp - currentTimestamp
     }
 
+    return { liquidityLevels, fees }
+}
+
+async function calculatePositionData(sessions, startBlock, endBlock, vestingPeriod) {
+
+    const position = await npm.positions(sessions[0].token.id, { blockTag: parseInt(sessions[0].startBlockNumber, 10) })
+
+    const symbol0 = await getTokenSymbolCached(position.token0)
+    const symbol1 = await getTokenSymbolCached(position.token1)
+
+    if (excludeListTokens.find(t => symbol0 == t || symbol1 == t)) {
+        return { amount: BigDecimal(0), symbol0, symbol1, position }
+    }
+    if (includeListTokenPairs.length > 0 && !includeListTokenPairs.find(t => symbol0 == t.symbolA && symbol1 == t.symbolB || symbol1 == t.symbolA && symbol0 == t.symbolB)) {
+        return { amount: BigDecimal(0), symbol0, symbol1, position }
+    }
+    if (includeListTokens.length > 0 && !includeListTokens.find(t => symbol0 == t || symbol1 == t)) {
+        return { amount: BigDecimal(0), symbol0, symbol1, position }
+    }
+
+    const liquidityLevels = {}
+    const fees = { amount0: BigNumber.from(0), amount1: BigNumber.from(0) }
+
+    // merge liquidity levels and fees of all sessions
+    for (const session of sessions) {
+        const res = await calculateSessionLiquidityLevelsAndFees(position, session, startBlock, endBlock, vestingPeriod)
+        for (const l in res.liquidityLevels) {
+            if (liquidityLevels[l]) {
+                liquidityLevels[l].secondsInside += res.liquidityLevels[l].secondsInside
+                liquidityLevels[l].totalSeconds += res.liquidityLevels[l].totalSeconds
+            } else {
+                liquidityLevels[l] = res.liquidityLevels[l]
+            }
+        }
+        fees.amount0 = fees.amount0.add(res.fees.amount0)
+        fees.amount1 = fees.amount1.add(res.fees.amount1)
+    }
+
     // calculate fair vesting factor considering vesting each liquidity level separately
     let vestedLiquidityTime = BigNumber.from(0)
     let totalLiquidityTime = BigNumber.from(0)
@@ -367,53 +383,31 @@ async function getGeneratedVestedFees(nftId, position, pool, from, to, endBlock,
     const vestingFactor = totalLiquidityTime.gt(0) ? BigDecimal(vestedLiquidityTime.toString()).div(BigDecimal(totalLiquidityTime.toString())) : BigDecimal(0)
 
     const generatedFees = await calculateValueAtBlock(fees.amount0, fees.amount1, position.token0, position.token1, endBlock)
-    return generatedFees.times(vestingFactor)
+    const amount = generatedFees.times(vestingFactor)
+
+    // log to see progress
+    console.log(sessions[0].token.id, amount.toString())
+
+    return { amount, symbol0, symbol1, position }
 }
 
-async function calculateSessionData(session, startBlock, endBlock, vestingPeriod, retries = 0) {
+async function calculateSessionLiquidityLevelsAndFees(position, session, startBlock, endBlock, retries = 0) {
 
     try {
         const from = parseInt(session.startBlockNumber, 10) < startBlock ? startBlock : parseInt(session.startBlockNumber, 10)
         const to = parseInt(session.endBlockNumber || ((endBlock + 1) + ""), 10) > endBlock ? endBlock : (parseInt(session.endBlockNumber, 10) - 1) // one block before removing from autocompounder - because of owner change
         const nftId = parseInt(session.token.id, 10)
-        const position = await npm.positions(nftId, { blockTag: from })
-
-        const symbol0 = await getTokenSymbolCached(position.token0)
-        const symbol1 = await getTokenSymbolCached(position.token1)
-
-        if (excludeListTokens.find(t => symbol0 == t || symbol1 == t)) {
-            return { amount: BigDecimal(0), symbol0, symbol1, position }
-        }
-        if (includeListTokenPairs.length > 0 && !includeListTokenPairs.find(t => symbol0 == t.symbolA && symbol1 == t.symbolB || symbol1 == t.symbolA && symbol0 == t.symbolB)) {
-            return { amount: BigDecimal(0), symbol0, symbol1, position }
-        }
-        if (includeListTokens.length > 0 && !includeListTokens.find(t => symbol0 == t || symbol1 == t)) {
-            return { amount: BigDecimal(0), symbol0, symbol1, position }
-        }
-        if (excludeListAccounts.find(a => a.toLowerCase() === session.account.toLowerCase())) {
-            return { amount: BigDecimal(0), symbol0, symbol1, position }
-        }
 
         const poolAddress = await factory.getPool(position.token0, position.token1, position.fee, { blockTag: from })
         const pool = new ethers.Contract(poolAddress, POOL_RAW.abi, provider)
 
-        const amount = await getGeneratedVestedFees(nftId, position, pool, from, to, endBlock, vestingPeriod)
-
-        // this should never happen - if it does needs fix
-        if (amount.lt(0)) {
-            throw Error("Invalid fees for token: ", session.token.id, amount.toString())
-        }
-
-        // log to see progress
-        console.log(nftId, amount.toString())
-
-        return { amount, symbol0, symbol1, position }
+        return await calculateLiquidityLevelsAndFees(nftId, position, pool, from, to)
     } catch (err) {
         // retry handling for rare temporary errors from alchemy rpc endpoint
         console.log("Err retrying", session.token.id, err)
         if (retries < 3) {
             await new Promise(r => setTimeout(r, 30000 * (retries + 1))) // increasing delay
-            return await calculateSessionData(session, startBlock, endBlock, vestingPeriod, retries + 1)
+            return await calculateSessionLiquidityLevelsAndFees(position, session, startBlock, endBlock, retries + 1)
         } else {
             throw err
         }
