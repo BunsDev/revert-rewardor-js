@@ -272,7 +272,8 @@ async function calculateLiquidityLevelsAndFees(nftId, position, pool, from, to) 
         try { 
             return await pool.snapshotCumulativesInside(position.tickLower, position.tickUpper, { blockTag: bn } )
         } catch (err) { 
-            console.log(err)
+            // there are 0 liquidity situations when snapshotCumulativesInside is not available.. 
+            // the code below will throw exception if any required one is missing - so catching exception silently is valid
             return null 
         }
     }))
@@ -395,6 +396,7 @@ async function calculatePositionData(sessions, startBlock, endBlock, vestingPeri
     // calculate fair vesting factor considering vesting each liquidity level separately
     let vestedLiquidityTime = BigNumber.from(0)
     let totalLiquidityTime = BigNumber.from(0)
+
 
     const liquidities = Object.keys(liquidityLevels).map(BigNumber.from).sort((a, b) => a.eq(b) ? 0 : a.lt(b) ? -1 : 1)
     let previousLiquidity = BigNumber.from(0)
